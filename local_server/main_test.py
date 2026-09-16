@@ -73,6 +73,42 @@ class UsageTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["percentage"], 90.0)
         self.assertEqual(result["scope"], "since backend start")
 
+    async def test_adds_transcription_usage(self) -> None:
+        with (
+            patch.object(main, "estimated_spend_usd", 0.0),
+            patch.object(main, "transcription_minutes", 0.0),
+            patch.object(main, "completed_turns", 0),
+            patch.object(main, "save_usage") as save_usage,
+        ):
+            await main.add_usage(0.00045, audio_minutes=0.1)
+
+            self.assertEqual(main.estimated_spend_usd, 0.00045)
+            self.assertEqual(main.transcription_minutes, 0.1)
+            save_usage.assert_called_once_with(0.00045, 0.1, 0)
+
+
+class SpeechTest(unittest.IsolatedAsyncioTestCase):
+    async def test_generates_finnish_neural_speech(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "piper"
+            voice = Path(directory) / "voice.onnx"
+            executable.touch()
+            voice.touch()
+
+            def create_output(command: list[str], **_kwargs: object) -> None:
+                Path(command[command.index("--output_file") + 1]).write_bytes(b"RIFFtest")
+
+            with (
+                patch.object(main, "PIPER_EXECUTABLE", str(executable)),
+                patch.object(main, "PIPER_VOICE", voice),
+                patch.object(main.subprocess, "run", side_effect=create_output) as run,
+            ):
+                response = await main.speech(main.SpeechRequest(text="Mitä kuuluu?"))
+
+            self.assertEqual(response.media_type, "audio/wav")
+            self.assertIn("--model", run.call_args.args[0])
+            response.background.func(*response.background.args, **response.background.kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

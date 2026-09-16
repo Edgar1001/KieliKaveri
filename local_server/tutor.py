@@ -93,7 +93,7 @@ Keep a natural conversation about {TOPIC_GUIDANCE[topic]}. The learner's latest 
 {LEVEL_GUIDANCE[level]}
 {MODE_GUIDANCE[language_mode]}
 
-Return JSON with exactly three fields:
+Return JSON with exactly four fields:
 - correctedText: natural, corrected Finnish. If it is already natural, repeat it exactly.
 - explanation: one brief, encouraging explanation in English. If no correction is needed, say "That sounds natural." Do not claim to assess pronunciation from a transcript.
 - reply: a short Finnish response that continues the conversation and ends with one easy question.

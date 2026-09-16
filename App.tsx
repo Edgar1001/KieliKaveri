@@ -14,12 +14,13 @@ import {
   AudioModule,
   RecordingPresets,
   setAudioModeAsync,
+  useAudioPlayer,
   useAudioRecorder,
   useAudioRecorderState,
 } from 'expo-audio';
 import Constants from 'expo-constants';
 import { fetch } from 'expo/fetch';
-import { File as ExpoFile } from 'expo-file-system';
+import { File as ExpoFile, Paths } from 'expo-file-system';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Speech from 'expo-speech';
 import { Mic, RotateCcw, Sparkles, Square, Volume2 } from 'lucide-react-native';
@@ -45,6 +46,8 @@ type Usage = {
   budgetUsd: number;
   percentage: number;
   scope: string;
+  transcriptionMinutes: number;
+  completedTurns: number;
 };
 
 class TutorResponseError extends Error {}
@@ -68,9 +71,11 @@ const SPEECH_RECORDING_OPTIONS = {
 
 export default function App() {
   const recorder = useAudioRecorder(SPEECH_RECORDING_OPTIONS);
+  const speechPlayer = useAudioPlayer(null);
   const recorderState = useAudioRecorderState(recorder, 100);
   const scrollRef = useRef<ScrollView>(null);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const finnishVoiceRef = useRef<string | undefined>(undefined);
   const [topic, setTopic] = useState<Topic>('Arki');
   const [level, setLevel] = useState<Level>('B2');
   const [languageMode, setLanguageMode] = useState<LanguageMode>('Puhekieli');
@@ -84,6 +89,15 @@ export default function App() {
       playsInSilentMode: true,
       interruptionMode: 'doNotMix',
     }).catch(() => undefined);
+    Speech.getAvailableVoicesAsync()
+      .then((voices) => {
+        const finnishVoices = voices.filter((voice) => voice.language.toLowerCase().startsWith('fi'));
+        finnishVoiceRef.current = (
+          finnishVoices.find((voice) => voice.quality === Speech.VoiceQuality.Enhanced)
+          ?? finnishVoices[0]
+        )?.identifier;
+      })
+      .catch(() => undefined);
 
     return () => {
       if (recordingTimeoutRef.current) {
@@ -141,6 +155,7 @@ export default function App() {
     }
 
     try {
+      const audioDurationMs = recorderState.durationMillis;
       await recorder.stop();
       const audioUri = recorder.uri;
       if (!audioUri) {
@@ -158,6 +173,7 @@ export default function App() {
       formData.append('topic', topic);
       formData.append('level', level);
       formData.append('languageMode', languageMode);
+      formData.append('audioDurationMs', `${audioDurationMs}`);
       formData.append(
         'history',
         JSON.stringify(turns.slice(-4).map(({ transcript, reply }) => ({ transcript, reply }))),
@@ -205,6 +221,7 @@ export default function App() {
       }
       return;
     }
+    speechPlayer.pause();
     await Speech.stop();
   }
 
@@ -251,7 +268,30 @@ export default function App() {
       });
       return;
     }
-    void Speech.stop().then(() => Speech.speak(text, { language: 'fi-FI', rate: 0.88 }));
+    void stopSpeaking().then(async () => {
+      const response = await fetch(`${API_URL}/api/speech`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-App-Key': APP_API_KEY,
+        },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) {
+        throw new Error('Finnish neural speech is unavailable.');
+      }
+      const speechFile = new ExpoFile(Paths.cache, 'kielikaveri-speech.wav');
+      speechFile.write(await response.bytes());
+      speechPlayer.replace(speechFile.uri);
+      speechPlayer.play();
+    }).catch(() => {
+      Speech.speak(text, {
+        language: 'fi-FI',
+        pitch: 1,
+        rate: 0.9,
+        voice: finnishVoiceRef.current,
+      });
+    });
   }
 
   const seconds = Math.floor(recorderState.durationMillis / 1000);
@@ -284,13 +324,15 @@ export default function App() {
               <View style={styles.usageHeader}>
                 <Text style={styles.usageLabel}>ARVIOITU API-KÄYTTÖ</Text>
                 <Text style={styles.usageValue}>
-                  {usage.percentage.toFixed(1)}%  (${usage.estimatedSpendUsd.toFixed(2)} / ${usage.budgetUsd.toFixed(2)})
+                  {usage.percentage.toFixed(2)}%  (${usage.estimatedSpendUsd.toFixed(4)} / ${usage.budgetUsd.toFixed(2)})
                 </Text>
               </View>
               <View style={styles.usageTrack}>
                 <View style={[styles.usageFill, { width: `${usage.percentage}%` }]} />
               </View>
-              <Text style={styles.usageScope}>Arvio palvelimen käynnistämisestä lähtien</Text>
+              <Text style={styles.usageScope}>
+                {usage.completedTurns} vastausta · {usage.transcriptionMinutes.toFixed(1)} min · {usage.scope === 'persistent estimate' ? 'tallennettu arvio' : 'nykyinen käyttökerta'}
+              </Text>
             </View>
           )}
 
@@ -385,13 +427,13 @@ export default function App() {
                   <Text style={styles.userText}>{turn.transcript}</Text>
                 </View>
 
-                {turn.correctedText !== turn.transcript && (
-                  <View style={styles.feedback}>
-                    <Text style={styles.feedbackLabel}>PIENI KORJAUS</Text>
-                    <Text style={styles.correctedText}>{turn.correctedText}</Text>
-                    <Text style={styles.explanation}>{turn.explanation}</Text>
-                  </View>
-                )}
+                <View style={styles.feedback}>
+                  <Text style={styles.feedbackLabel}>
+                    {turn.correctedText === turn.transcript ? 'HYVIN SANOTTU' : 'KORJAUS'}
+                  </Text>
+                  <Text style={styles.correctedText}>{turn.correctedText}</Text>
+                  <Text style={styles.explanation}>{turn.explanation}</Text>
+                </View>
 
                 <View style={styles.tutorMessage}>
                   <View style={styles.avatar}>

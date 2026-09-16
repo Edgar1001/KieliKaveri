@@ -9,7 +9,8 @@ Android APK
   -> Railway HTTPS API
      -> OpenAI gpt-transcribe (Finnish speech-to-text)
      -> OpenAI GPT-4.1 (correction, conversation, translation)
-  -> Android Finnish text-to-speech
+    -> Piper fi_FI-harri-medium (Finnish neural speech)
+  -> Android Finnish text-to-speech fallback
 ```
 
 The app starts at B2 and Puhekieli and includes A2-C2 levels, Puhekieli/Kirjakieli, corrections, English explanations and translations, conversation history, replay, restart, and an estimated API budget meter.
@@ -28,6 +29,7 @@ APP_API_KEY=a-long-random-value
 OPENAI_BUDGET_USD=5
 OPENAI_INPUT_COST_PER_MILLION=2
 OPENAI_OUTPUT_COST_PER_MILLION=8
+OPENAI_TRANSCRIPTION_COST_PER_MINUTE=0.0045
 MAX_AUDIO_BYTES=15728640
 USAGE_FILE=/data/usage.json
 ```
@@ -123,7 +125,8 @@ Export `.env` before running Gradle so Metro receives `EXPO_PUBLIC_API_URL` and 
 ## Security and cost
 
 - Set hard spending limits in OpenAI; the in-app meter is only an estimate.
-- The current meter covers tutor-model token usage and can persist on `/data`; OpenAI billing remains authoritative.
+- The meter covers transcription duration and actual tutor-model token usage. It can persist on `/data`; OpenAI billing remains authoritative.
+- Railway serves the same Finnish Piper voice as the browser app. Android falls back to its best installed `fi-FI` voice if neural speech is unavailable.
 - Railway hosting and OpenAI API usage are billed separately.
 - For personal use, the app key plus Railway/OpenAI limits is reasonable. Before public distribution, add user authentication, database-backed quotas, abuse monitoring, and per-user rate limits.
 - Recordings are temporary files and are deleted after each request, but their audio is sent to OpenAI for transcription.

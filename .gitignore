@@ -40,7 +40,6 @@ server-data/
 # local Python environment and caches
 .venv/
 __pycache__/
-local_server/voices/
 
 # typescript
 *.tsbuildinfo
