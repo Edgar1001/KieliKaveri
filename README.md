@@ -99,6 +99,24 @@ npx eas-cli@latest build --platform android --profile preview
 
 EAS returns a download URL. Open it on the Android phone, download the APK, and allow installation from that browser when Android prompts.
 
+## Local Gradle APK build
+
+EAS is not required for a local APK. The machine needs JDK 17, Android SDK tools, and `adb`. Generate the native Android project and build it with the included Gradle wrapper:
+
+```bash
+npx expo prebuild --platform android
+cd android
+./gradlew assembleRelease
+```
+
+The APK is created at `android/app/build/outputs/apk/release/app-release.apk`. With a USB-debugging-enabled phone connected, install it with:
+
+```bash
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+```
+
+The generated `android/` directory is ignored because it can be recreated from the Expo project. A local release build is suitable for personal installation; configure a proper release keystore before distributing through Google Play.
+
 ## Security and cost
 
 - Set hard spending limits in OpenAI; the in-app meter is only an estimate.
