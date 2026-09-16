@@ -104,6 +104,9 @@ EAS returns a download URL. Open it on the Android phone, download the APK, and 
 EAS is not required for a local APK. The machine needs JDK 17, Android SDK tools, and `adb`. Generate the native Android project and build it with the included Gradle wrapper:
 
 ```bash
+set -a
+. .env
+set +a
 npx expo prebuild --platform android
 cd android
 ./gradlew assembleRelease
@@ -115,7 +118,7 @@ The APK is created at `android/app/build/outputs/apk/release/app-release.apk`. W
 adb install -r android/app/build/outputs/apk/release/app-release.apk
 ```
 
-The generated `android/` directory is ignored because it can be recreated from the Expo project. A local release build is suitable for personal installation; configure a proper release keystore before distributing through Google Play.
+Export `.env` before running Gradle so Metro receives `EXPO_PUBLIC_API_URL` and `EXPO_PUBLIC_APP_API_KEY` during the release bundle step. Run `npx expo prebuild` after changing `.env`. The generated `android/` directory is ignored because it can be recreated from the Expo project. A local release build is suitable for personal installation; configure a proper release keystore before distributing through Google Play.
 
 ## Security and cost
 
