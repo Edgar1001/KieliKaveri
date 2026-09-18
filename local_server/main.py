@@ -3,9 +3,9 @@ import json
 import logging
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
+import threading
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from openai import APIError, AsyncOpenAI, OpenAIError
+from piper import PiperVoice
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from starlette.background import BackgroundTask
 
@@ -44,7 +45,6 @@ OPENAI_TRANSCRIPTION_COST_PER_MINUTE = float(
     os.getenv("OPENAI_TRANSCRIPTION_COST_PER_MINUTE", "0.0045")
 )
 USAGE_FILE = Path(os.environ["USAGE_FILE"]) if os.getenv("USAGE_FILE") else None
-PIPER_EXECUTABLE = os.getenv("PIPER_EXECUTABLE", str(Path(sys.executable).with_name("piper")))
 PIPER_VOICE = Path(
     os.getenv(
         "PIPER_VOICE",
@@ -57,6 +57,8 @@ LEVEL_ADAPTER = TypeAdapter(Level)
 LANGUAGE_MODE_ADAPTER = TypeAdapter(LanguageMode)
 INFERENCE_LOCK = asyncio.Lock()
 usage_lock = asyncio.Lock()
+PIPER_LOCK = threading.Lock()
+piper_voice: PiperVoice | None = None
 
 
 def load_usage() -> tuple[float, float, int]:
@@ -101,6 +103,16 @@ async def add_usage(cost: float, audio_minutes: float = 0.0, turn_completed: boo
         transcription_minutes += audio_minutes
         completed_turns += int(turn_completed)
         save_usage(estimated_spend_usd, transcription_minutes, completed_turns)
+
+
+def synthesize_speech(text: str, output_path: Path) -> None:
+    global piper_voice
+
+    with PIPER_LOCK:
+        if piper_voice is None:
+            piper_voice = PiperVoice.load(PIPER_VOICE)
+        with wave.open(str(output_path), "wb") as wav_file:
+            piper_voice.synthesize_wav(text, wav_file)
 
 app = FastAPI(
     title="Kielikaveri API",
@@ -259,29 +271,20 @@ async def usage() -> dict[str, float | int | str]:
     dependencies=[Depends(require_app_key)],
 )
 async def speech(request: SpeechRequest) -> FileResponse:
-    if not Path(PIPER_EXECUTABLE).is_file() or not PIPER_VOICE.is_file():
+    if not PIPER_VOICE.is_file():
         raise HTTPException(status_code=503, detail="Finnish neural speech is not installed.")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output_file:
         output_path = Path(output_file.name)
     try:
         await asyncio.to_thread(
-            subprocess.run,
-            [
-                PIPER_EXECUTABLE,
-                "--model",
-                str(PIPER_VOICE),
-                "--output_file",
-                str(output_path),
-            ],
-            input=request.text,
-            text=True,
-            capture_output=True,
-            check=True,
+            synthesize_speech,
+            request.text,
+            output_path,
         )
-    except subprocess.CalledProcessError as error:
+    except Exception as error:
         output_path.unlink(missing_ok=True)
-        LOGGER.error("Piper synthesis failed: %s", error.stderr.strip())
+        LOGGER.exception("Piper synthesis failed")
         raise HTTPException(status_code=503, detail="Finnish speech synthesis failed.") from error
 
     return FileResponse(

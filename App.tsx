@@ -23,11 +23,18 @@ import { fetch } from 'expo/fetch';
 import { File as ExpoFile, Paths } from 'expo-file-system';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Speech from 'expo-speech';
-import { Mic, RotateCcw, Sparkles, Square, Volume2 } from 'lucide-react-native';
+import {
+  ChevronDown,
+  ChevronUp,
+  Mic,
+  RotateCcw,
+  Sparkles,
+  Square,
+  Volume2,
+} from 'lucide-react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
-type Topic = 'Arki' | 'Kahvila' | 'Työ';
 type Level = 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 type LanguageMode = 'Puhekieli' | 'Kirjakieli';
 
@@ -55,7 +62,6 @@ class TutorResponseError extends Error {}
 const developmentHost = Constants.expoConfig?.hostUri?.split(':')[0] ?? 'localhost';
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? `http://${developmentHost}:8787`;
 const APP_API_KEY = process.env.EXPO_PUBLIC_APP_API_KEY ?? '';
-const TOPICS: Topic[] = ['Arki', 'Kahvila', 'Työ'];
 const LEVELS: Level[] = ['A2', 'B1', 'B2', 'C1', 'C2'];
 const LANGUAGE_MODES: LanguageMode[] = ['Puhekieli', 'Kirjakieli'];
 let webSpeechAudio: HTMLAudioElement | null = null;
@@ -76,9 +82,9 @@ export default function App() {
   const scrollRef = useRef<ScrollView>(null);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const finnishVoiceRef = useRef<string | undefined>(undefined);
-  const [topic, setTopic] = useState<Topic>('Arki');
   const [level, setLevel] = useState<Level>('B2');
   const [languageMode, setLanguageMode] = useState<LanguageMode>('Puhekieli');
+  const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -174,7 +180,7 @@ export default function App() {
       } else {
         formData.append('audio', new ExpoFile(audioUri));
       }
-      formData.append('topic', topic);
+      formData.append('topic', 'Arki');
       formData.append('level', level);
       formData.append('languageMode', languageMode);
       formData.append('audioDurationMs', `${audioDurationMs}`);
@@ -277,6 +283,12 @@ export default function App() {
       });
       return;
     }
+    if (!finnishVoiceRef.current) {
+      void playNeuralSpeech(text).catch((error: unknown) => {
+        console.warn('Neural Finnish playback failed.', error);
+      });
+      return;
+    }
     void stopSpeaking().then(() => {
       let fallbackStarted = false;
       let speechStarted = false;
@@ -339,6 +351,12 @@ export default function App() {
     speechFile.write(await response.bytes());
     speechPlayer.volume = 1;
     speechPlayer.replace(speechFile.uri);
+    for (let attempt = 0; attempt < 100 && !speechPlayer.isLoaded; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!speechPlayer.isLoaded) {
+      throw new Error('Finnish neural speech could not be loaded.');
+    }
     speechPlayer.play();
   }
 
@@ -385,63 +403,64 @@ export default function App() {
           )}
 
           <View style={styles.practiceSettings}>
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>TASO</Text>
-              <View accessibilityRole="tablist" style={styles.compactSelector}>
-                {LEVELS.map((item) => (
-                  <Pressable
-                    accessibilityRole="tab"
-                    accessibilityState={{ selected: level === item }}
-                    disabled={isProcessing || recorderState.isRecording}
-                    key={item}
-                    onPress={() => setLevel(item)}
-                    style={[styles.compactButton, level === item && styles.compactButtonActive]}
-                  >
-                    <Text style={[styles.compactText, level === item && styles.compactTextActive]}>
-                      {item}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-            </View>
+            <Pressable
+              accessibilityLabel={settingsExpanded ? 'Collapse practice settings' : 'Expand practice settings'}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: settingsExpanded }}
+              onPress={() => setSettingsExpanded((current) => !current)}
+              style={({ pressed }) => [styles.settingsToggle, pressed && styles.settingsTogglePressed]}
+            >
+              <Text style={styles.settingsSummary}>TASO {level} · TYYLI {languageMode}</Text>
+              {settingsExpanded
+                ? <ChevronUp color="#31564D" size={20} />
+                : <ChevronDown color="#31564D" size={20} />}
+            </Pressable>
 
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>TYYLI</Text>
-              <View accessibilityRole="tablist" style={styles.compactSelector}>
-                {LANGUAGE_MODES.map((item) => (
-                  <Pressable
-                    accessibilityRole="tab"
-                    accessibilityState={{ selected: languageMode === item }}
-                    disabled={isProcessing || recorderState.isRecording}
-                    key={item}
-                    onPress={() => setLanguageMode(item)}
-                    style={[styles.modeButton, languageMode === item && styles.compactButtonActive]}
-                  >
-                    <Text
-                      style={[styles.compactText, languageMode === item && styles.compactTextActive]}
-                    >
-                      {item}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-            </View>
-          </View>
+            {settingsExpanded && (
+              <View style={styles.expandedSettings}>
+                <View style={styles.settingRow}>
+                  <Text style={styles.settingLabel}>TASO</Text>
+                  <View accessibilityRole="tablist" style={styles.compactSelector}>
+                    {LEVELS.map((item) => (
+                      <Pressable
+                        accessibilityRole="tab"
+                        accessibilityState={{ selected: level === item }}
+                        disabled={isProcessing || recorderState.isRecording}
+                        key={item}
+                        onPress={() => setLevel(item)}
+                        style={[styles.compactButton, level === item && styles.compactButtonActive]}
+                      >
+                        <Text style={[styles.compactText, level === item && styles.compactTextActive]}>
+                          {item}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
 
-          <View accessibilityRole="tablist" style={styles.topicSelector}>
-            {TOPICS.map((item) => (
-              <Pressable
-                accessibilityRole="tab"
-                accessibilityState={{ selected: topic === item }}
-                key={item}
-                onPress={() => setTopic(item)}
-                style={[styles.topicButton, topic === item && styles.topicButtonActive]}
-              >
-                <Text style={[styles.topicText, topic === item && styles.topicTextActive]}>
-                  {item}
-                </Text>
-              </Pressable>
-            ))}
+                <View style={styles.settingRow}>
+                  <Text style={styles.settingLabel}>TYYLI</Text>
+                  <View accessibilityRole="tablist" style={styles.compactSelector}>
+                    {LANGUAGE_MODES.map((item) => (
+                      <Pressable
+                        accessibilityRole="tab"
+                        accessibilityState={{ selected: languageMode === item }}
+                        disabled={isProcessing || recorderState.isRecording}
+                        key={item}
+                        onPress={() => setLanguageMode(item)}
+                        style={[styles.modeButton, languageMode === item && styles.compactButtonActive]}
+                      >
+                        <Text
+                          style={[styles.compactText, languageMode === item && styles.compactTextActive]}
+                        >
+                          {item}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              </View>
+            )}
           </View>
 
           <ScrollView
@@ -592,7 +611,18 @@ const styles = StyleSheet.create({
   usageTrack: { backgroundColor: '#DCE5DE', borderRadius: 3, height: 5, marginTop: 5, overflow: 'hidden' },
   usageFill: { backgroundColor: '#C64B38', borderRadius: 3, height: '100%' },
   usageScope: { color: '#84958F', fontSize: 9, marginTop: 3 },
-  practiceSettings: { gap: 8, paddingBottom: 12, paddingHorizontal: 22 },
+  practiceSettings: { paddingBottom: 8, paddingHorizontal: 22 },
+  settingsToggle: {
+    alignItems: 'center',
+    borderBottomColor: '#D8DED5',
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    minHeight: 36,
+  },
+  settingsTogglePressed: { opacity: 0.65 },
+  settingsSummary: { color: '#31564D', fontSize: 11, fontWeight: '900' },
+  expandedSettings: { gap: 8, paddingTop: 8 },
   settingRow: { alignItems: 'center', flexDirection: 'row', gap: 10 },
   settingLabel: { color: '#587068', fontSize: 10, fontWeight: '900', width: 38 },
   compactSelector: {
@@ -622,20 +652,7 @@ const styles = StyleSheet.create({
   compactButtonActive: { backgroundColor: '#173E35' },
   compactText: { color: '#587068', fontSize: 12, fontWeight: '800' },
   compactTextActive: { color: '#FFFDF7' },
-  topicSelector: {
-    alignSelf: 'center',
-    backgroundColor: 'rgba(255,255,255,0.62)',
-    borderColor: '#D8DED5',
-    borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    padding: 3,
-  },
-  topicButton: { borderRadius: 6, minWidth: 78, paddingHorizontal: 14, paddingVertical: 8 },
-  topicButtonActive: { backgroundColor: '#F7C948' },
-  topicText: { color: '#587068', fontSize: 13, fontWeight: '700', textAlign: 'center' },
-  topicTextActive: { color: '#173E35' },
-  conversation: { gap: 20, paddingHorizontal: 22, paddingBottom: 28, paddingTop: 28 },
+  conversation: { gap: 20, paddingHorizontal: 22, paddingBottom: 28, paddingTop: 14 },
   tutorMessage: { alignItems: 'flex-start', flexDirection: 'row', gap: 12, maxWidth: '92%' },
   avatar: {
     alignItems: 'center',

@@ -1,8 +1,9 @@
 import unittest
 import tempfile
+import wave
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -112,26 +113,39 @@ class UsageTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SpeechTest(unittest.IsolatedAsyncioTestCase):
-    async def test_generates_finnish_neural_speech(self) -> None:
+    async def test_generates_finnish_neural_speech_with_cached_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "piper"
             voice = Path(directory) / "voice.onnx"
-            executable.touch()
             voice.touch()
 
-            def create_output(command: list[str], **_kwargs: object) -> None:
-                Path(command[command.index("--output_file") + 1]).write_bytes(b"RIFFtest")
+            def synthesize(_text: str, wav_file: wave.Wave_write) -> None:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(22_050)
+                wav_file.writeframes(b"\x00\x00")
+
+            loaded_voice = SimpleNamespace(synthesize_wav=Mock(side_effect=synthesize))
 
             with (
-                patch.object(main, "PIPER_EXECUTABLE", str(executable)),
                 patch.object(main, "PIPER_VOICE", voice),
-                patch.object(main.subprocess, "run", side_effect=create_output) as run,
+                patch.object(main, "piper_voice", None),
+                patch.object(main.PiperVoice, "load", return_value=loaded_voice) as load,
             ):
-                response = await main.speech(main.SpeechRequest(text="Mitä kuuluu?"))
+                first_response = await main.speech(main.SpeechRequest(text="Mitä kuuluu?"))
+                second_response = await main.speech(main.SpeechRequest(text="Hyvää kuuluu."))
 
-            self.assertEqual(response.media_type, "audio/wav")
-            self.assertIn("--model", run.call_args.args[0])
-            response.background.func(*response.background.args, **response.background.kwargs)
+            self.assertEqual(first_response.media_type, "audio/wav")
+            self.assertEqual(second_response.media_type, "audio/wav")
+            load.assert_called_once_with(voice)
+            self.assertEqual(loaded_voice.synthesize_wav.call_count, 2)
+            first_response.background.func(
+                *first_response.background.args,
+                **first_response.background.kwargs,
+            )
+            second_response.background.func(
+                *second_response.background.args,
+                **second_response.background.kwargs,
+            )
 
 
 if __name__ == "__main__":
