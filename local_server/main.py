@@ -6,13 +6,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from openai import APIError, AsyncOpenAI
+from openai import APIError, AsyncOpenAI, OpenAIError
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from starlette.background import BackgroundTask
 
@@ -30,6 +31,8 @@ logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("language-tutor")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_ADMIN_API_KEY = os.getenv("OPENAI_ADMIN_API_KEY", "")
+OPENAI_USAGE_PROJECT_ID = os.getenv("OPENAI_USAGE_PROJECT_ID", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe")
 APP_API_KEY = os.getenv("APP_API_KEY", "")
@@ -196,6 +199,45 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/usage", dependencies=[Depends(require_app_key)])
 async def usage() -> dict[str, float | int | str]:
+    if OPENAI_ADMIN_API_KEY:
+        month_start = datetime.now(timezone.utc).replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        query: dict[str, Any] = {
+            "start_time": int(month_start.timestamp()),
+            "bucket_width": "1d",
+            "limit": 31,
+        }
+        if OPENAI_USAGE_PROJECT_ID:
+            query["project_ids"] = [OPENAI_USAGE_PROJECT_ID]
+        try:
+            client = AsyncOpenAI(admin_api_key=OPENAI_ADMIN_API_KEY, timeout=15)
+            costs = await client.admin.organization.usage.costs(**query)
+            spend = sum(
+                result.amount.value
+                for bucket in costs.data
+                for result in bucket.results
+                if result.object == "organization.costs.result"
+                and result.amount is not None
+                and result.amount.value is not None
+                and result.amount.currency == "usd"
+            )
+            percentage = min(100.0, spend / OPENAI_BUDGET_USD * 100) if OPENAI_BUDGET_USD else 0.0
+            return {
+                "estimatedSpendUsd": round(spend, 6),
+                "budgetUsd": OPENAI_BUDGET_USD,
+                "percentage": round(percentage, 2),
+                "scope": "OpenAI Platform, current month",
+                "transcriptionMinutes": 0.0,
+                "completedTurns": 0,
+            }
+        except OpenAIError:
+            LOGGER.warning("OpenAI platform costs unavailable; using local usage", exc_info=True)
+
     async with usage_lock:
         spend = estimated_spend_usd
         minutes = transcription_minutes

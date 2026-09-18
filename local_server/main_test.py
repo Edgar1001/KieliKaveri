@@ -64,6 +64,7 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
 class UsageTest(unittest.IsolatedAsyncioTestCase):
     async def test_usage_returns_capped_percentage(self) -> None:
         with (
+            patch.object(main, "OPENAI_ADMIN_API_KEY", ""),
             patch.object(main, "estimated_spend_usd", 4.5),
             patch.object(main, "OPENAI_BUDGET_USD", 5.0),
         ):
@@ -72,6 +73,29 @@ class UsageTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["estimatedSpendUsd"], 4.5)
         self.assertEqual(result["percentage"], 90.0)
         self.assertEqual(result["scope"], "since backend start")
+
+    async def test_usage_returns_openai_platform_costs_with_admin_key(self) -> None:
+        amount = SimpleNamespace(value=1.25, currency="usd")
+        cost = SimpleNamespace(object="organization.costs.result", amount=amount)
+        costs = AsyncMock(
+            return_value=SimpleNamespace(data=[SimpleNamespace(results=[cost])])
+        )
+        client = SimpleNamespace(
+            admin=SimpleNamespace(
+                organization=SimpleNamespace(usage=SimpleNamespace(costs=costs))
+            )
+        )
+        with (
+            patch.object(main, "OPENAI_ADMIN_API_KEY", "admin-key"),
+            patch.object(main, "OPENAI_BUDGET_USD", 5.0),
+            patch.object(main, "AsyncOpenAI", return_value=client) as openai_client,
+        ):
+            result = await main.usage()
+
+        self.assertEqual(result["estimatedSpendUsd"], 1.25)
+        self.assertEqual(result["percentage"], 25.0)
+        self.assertEqual(result["scope"], "OpenAI Platform, current month")
+        openai_client.assert_called_once_with(admin_api_key="admin-key", timeout=15)
 
     async def test_adds_transcription_usage(self) -> None:
         with (

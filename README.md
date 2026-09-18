@@ -23,6 +23,8 @@ Add these variables to the Railway service (copy names from `railway.env.example
 
 ```dotenv
 OPENAI_API_KEY=your-private-openai-key
+OPENAI_ADMIN_API_KEY=your-openai-admin-key
+OPENAI_USAGE_PROJECT_ID=
 OPENAI_MODEL=gpt-4.1
 OPENAI_TRANSCRIPTION_MODEL=gpt-transcribe
 APP_API_KEY=a-long-random-value
@@ -33,6 +35,8 @@ OPENAI_TRANSCRIPTION_COST_PER_MINUTE=0.0045
 MAX_AUDIO_BYTES=15728640
 USAGE_FILE=/data/usage.json
 ```
+
+`OPENAI_ADMIN_API_KEY` enables the in-app usage meter to read the current month's actual OpenAI Platform costs. Leave `OPENAI_USAGE_PROJECT_ID` empty to report organization-wide costs, or set it to limit the report to one OpenAI project. Without the admin key, the app falls back to its local estimate.
 
 Generate `APP_API_KEY` locally with:
 

@@ -92,10 +92,14 @@ export default function App() {
     Speech.getAvailableVoicesAsync()
       .then((voices) => {
         const finnishVoices = voices.filter((voice) => voice.language.toLowerCase().startsWith('fi'));
-        finnishVoiceRef.current = (
-          finnishVoices.find((voice) => voice.quality === Speech.VoiceQuality.Enhanced)
-          ?? finnishVoices[0]
-        )?.identifier;
+        const selectedVoice = finnishVoices.find(
+          (voice) => voice.language.toLowerCase() === 'fi-fi'
+            && voice.quality === Speech.VoiceQuality.Enhanced,
+        ) ?? finnishVoices.find(
+          (voice) => voice.quality === Speech.VoiceQuality.Enhanced,
+        ) ?? finnishVoices[0];
+        finnishVoiceRef.current = selectedVoice?.identifier;
+        console.info('Selected Finnish Android voice:', selectedVoice?.identifier ?? 'system default');
       })
       .catch(() => undefined);
 
@@ -192,7 +196,12 @@ export default function App() {
       const turn = { ...result, id: `${Date.now()}` };
       setTurns((current) => [...current, turn]);
       void refreshUsage();
-      await setAudioModeAsync({ allowsRecording: false });
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+        interruptionMode: 'doNotMix',
+        shouldRouteThroughEarpiece: false,
+      });
       speak(turn.reply);
       requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
     } catch (error) {
@@ -268,30 +277,69 @@ export default function App() {
       });
       return;
     }
-    void stopSpeaking().then(async () => {
-      const response = await fetch(`${API_URL}/api/speech`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-App-Key': APP_API_KEY,
-        },
-        body: JSON.stringify({ text }),
-      });
-      if (!response.ok) {
-        throw new Error('Finnish neural speech is unavailable.');
-      }
-      const speechFile = new ExpoFile(Paths.cache, 'kielikaveri-speech.wav');
-      speechFile.write(await response.bytes());
-      speechPlayer.replace(speechFile.uri);
-      speechPlayer.play();
-    }).catch(() => {
+    void stopSpeaking().then(() => {
+      let fallbackStarted = false;
+      let speechStarted = false;
+      const fallbackToNeuralSpeech = () => {
+        if (fallbackStarted || speechStarted) {
+          return;
+        }
+        fallbackStarted = true;
+        console.warn('Android speech did not start; trying neural audio.');
+        void playNeuralSpeech(text).catch((error: unknown) => {
+          console.warn('Neural Finnish playback failed.', error);
+        });
+      };
+      const fallbackTimer = setTimeout(fallbackToNeuralSpeech, 3000);
       Speech.speak(text, {
         language: 'fi-FI',
         pitch: 1,
-        rate: 0.9,
+        rate: 0.86,
+        volume: 1,
         voice: finnishVoiceRef.current,
+        onStart: () => {
+          speechStarted = true;
+          clearTimeout(fallbackTimer);
+          console.info('Finnish Android speech started.');
+        },
+        onDone: () => {
+          clearTimeout(fallbackTimer);
+          console.info('Finnish Android speech finished.');
+        },
+        onError: (error) => {
+          clearTimeout(fallbackTimer);
+          console.warn('Android Finnish speech failed; trying neural audio.', error);
+          fallbackStarted = true;
+          void playNeuralSpeech(text).catch((fallbackError: unknown) => {
+            console.warn('Neural Finnish playback failed.', fallbackError);
+          });
+        },
+      });
+    }).catch((error: unknown) => {
+      console.warn('Android speech setup failed; trying neural audio.', error);
+      void playNeuralSpeech(text).catch((fallbackError: unknown) => {
+        console.warn('Neural Finnish playback failed.', fallbackError);
       });
     });
+  }
+
+  async function playNeuralSpeech(text: string) {
+    const response = await fetch(`${API_URL}/api/speech`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-App-Key': APP_API_KEY,
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (!response.ok) {
+      throw new Error('Finnish neural speech is unavailable.');
+    }
+    const speechFile = new ExpoFile(Paths.cache, `kielikaveri-speech-${Date.now()}.wav`);
+    speechFile.write(await response.bytes());
+    speechPlayer.volume = 1;
+    speechPlayer.replace(speechFile.uri);
+    speechPlayer.play();
   }
 
   const seconds = Math.floor(recorderState.durationMillis / 1000);
