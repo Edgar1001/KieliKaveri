@@ -62,6 +62,19 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create.await_args.kwargs["extra_body"], {"languages": ["fi"]})
 
 
+class HealthTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reports_finnish_speech_when_model_files_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            voice = Path(directory) / "voice.onnx"
+            voice.touch()
+            voice.with_suffix(".onnx.json").touch()
+
+            with patch.object(main, "PIPER_VOICE", voice):
+                result = await main.health()
+
+        self.assertTrue(result["finnishSpeechConfigured"])
+
+
 class UsageTest(unittest.IsolatedAsyncioTestCase):
     async def test_usage_returns_capped_percentage(self) -> None:
         with (

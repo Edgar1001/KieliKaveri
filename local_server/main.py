@@ -205,7 +205,8 @@ async def health() -> dict[str, Any]:
         "appCredentialsConfigured": bool(APP_API_KEY),
         "openaiModel": OPENAI_MODEL,
         "transcriptionModel": OPENAI_TRANSCRIPTION_MODEL,
-        "finnishSpeechConfigured": Path(PIPER_EXECUTABLE).is_file() and PIPER_VOICE.is_file(),
+        "finnishSpeechConfigured": PIPER_VOICE.is_file()
+        and PIPER_VOICE.with_suffix(".onnx.json").is_file(),
     }
 
 
