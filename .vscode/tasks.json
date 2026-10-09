@@ -1,0 +1,37 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Expo Android Preview",
+			"type": "shell",
+			"command": "npx",
+			"args": [
+				"--yes",
+				"--package=node@22",
+				"node",
+				"node_modules/expo/bin/cli",
+				"start",
+				"--android",
+				"--port",
+				"8081"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build Android Realtime",
+			"type": "shell",
+			"command": "npx",
+			"args": [
+				"--yes",
+				"--package=node@22",
+				"node",
+				"node_modules/expo/bin/cli",
+				"run:android",
+				"--no-bundler"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

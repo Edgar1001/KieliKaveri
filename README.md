@@ -13,7 +13,11 @@ Android APK
   -> Android Finnish text-to-speech fallback
 ```
 
-The app starts at B2 and Puhekieli and includes A2-C2 levels, Puhekieli/Kirjakieli, corrections, English explanations and translations, conversation history, replay, restart, and an estimated API budget meter.
+The app starts at B2 and Puhekieli and includes A2-C2 levels, Puhekieli/Kirjakieli, corrections, English explanations and translations, conversation history, replay, restart, and an estimated API budget meter. The Puhe/Viestit/Auto puhe/RT puhe mode switch selects recorded voice, written conversation, hands-free recorded voice, or realtime voice while preserving shared history and unsent text. Written mode uses a text composer without recording, playback, or automatic speech. Puhe, Viestit, and Auto puhe use `/api/conversation`.
+
+Auto puhe uses the same transcription model, tutor model, speech playback, correction cards, and API pricing as Puhe, not realtime audio pricing. Tap start once: local microphone metering sends each utterance after about 1.6 seconds of quiet, then resumes recording after the tutor finishes speaking. The microphone is off during processing and replies, so spoken interruptions are not supported. Silence-only recordings are never uploaded, and each recording is limited to one minute; an idle minute stops the session. Recorded pauses still count toward transcription duration, so identical model rates do not imply identical total cost. This mode requires Android microphone metering, stops in the background, and may misidentify speech in windy or noisy conditions. Tap stop to discard the current recording and cancel pending client work; server work already started may still be billed.
+
+RT puhe uses OpenAI Realtime over WebRTC. Start a session once, then speak naturally: speech detection handles turns and interruptions without pressing a recording button for each message. This mode shows live transcripts and gives corrections aloud rather than generating the structured correction and translation cards used by Puhe/Viestit. It uses the selected level, language style, and recent conversation history. Sessions stop when leaving the mode or putting the app in the background; Bluetooth-specific routing and locked-screen operation are not part of this mode. Deploy the updated Railway backend, including `/api/realtime/session`, before using RT puhe. The backend exchanges the connection offer with OpenAI using its private key; audio then streams directly over WebRTC.
 
 ## 1. Deploy the backend to Railway
 
@@ -27,6 +31,7 @@ OPENAI_ADMIN_API_KEY=your-openai-admin-key
 OPENAI_USAGE_PROJECT_ID=
 OPENAI_MODEL=gpt-4.1
 OPENAI_TRANSCRIPTION_MODEL=gpt-transcribe
+OPENAI_REALTIME_MODEL=gpt-realtime-2.1
 APP_API_KEY=a-long-random-value
 OPENAI_BUDGET_USD=5
 OPENAI_INPUT_COST_PER_MILLION=2
@@ -36,7 +41,9 @@ MAX_AUDIO_BYTES=15728640
 USAGE_FILE=/data/usage.json
 ```
 
-`OPENAI_ADMIN_API_KEY` enables the in-app usage meter to read the current month's actual OpenAI Platform costs. Leave `OPENAI_USAGE_PROJECT_ID` empty to report organization-wide costs, or set it to limit the report to one OpenAI project. Without the admin key, the app falls back to its local estimate.
+`OPENAI_ADMIN_API_KEY` enables automatic spending totals for the current UTC month across the whole OpenAI organization, including all cost result pages. The app refreshes once a minute; OpenAI billing data can arrive late. `OPENAI_USAGE_PROJECT_ID` does not filter these totals. The bar compares spending with `OPENAI_BUDGET_USD`, a spending target, not a credit balance. Monthly spending resets each month. OpenAI's supported API does not expose the live prepaid balance or top-ups; the billing shortcut opens the OpenAI dashboard where the actual balance is available. No starting balance or manual top-up tracking is required.
+
+Without an admin key, the app explicitly displays an app-only cost estimate instead of organization spending. That estimate covers Puhe/Viestit, not realtime sessions; organization billing includes realtime charges when OpenAI reports them. If organization billing requests fail, the last displayed value is marked stale rather than silently replaced with app-only costs.
 
 Generate `APP_API_KEY` locally with:
 
@@ -51,7 +58,7 @@ In the Railway service:
 1. Set **Healthcheck Path** to `/api/health`.
 2. Under **Networking -> Public Networking**, click **Generate Domain**.
 3. Keep one replica for the in-process request lock and usage estimate.
-4. Optional: attach a small volume mounted at `/data` so `USAGE_FILE` survives restarts.
+4. Optional: attach a small volume mounted at `/data` so the app-only estimate in `USAGE_FILE` survives restarts and redeployments. Organization spending is fetched from OpenAI and does not require a volume.
 5. Deploy and verify `https://YOUR-DOMAIN/api/health` returns `status: ok`.
 
 The old Railway `railway.json` config format is deprecated in 2026, so these settings intentionally live in the Railway dashboard while the Dockerfile remains in source control.
@@ -79,7 +86,11 @@ Install and check the app:
 npm install
 npm run typecheck
 npm test
+npm run test:realtime
+npm run test:auto-speech
 ```
+
+Use Node.js 22 or newer for Expo SDK 57. RT puhe requires a native Android build because Expo Go does not include WebRTC. With Android SDK tools, JDK 17, and an emulator or USB-debugging-enabled phone available, `npm run android` builds and launches the native debug app with Metro. Puhe and Viestit remain available in Expo Go.
 
 ## 3. Build an installable APK
 
@@ -128,10 +139,11 @@ Export `.env` before running Gradle so Metro receives `EXPO_PUBLIC_API_URL` and 
 
 ## Security and cost
 
-- Set hard spending limits in OpenAI; the in-app meter is only an estimate.
-- The meter covers transcription duration and actual tutor-model token usage. It can persist on `/data`; OpenAI billing remains authoritative.
+- Set spending limits and auto-recharge settings in OpenAI as appropriate; the in-app bar shows spending against a budget, not remaining prepaid credit.
+- The app-only meter covers recorded transcription duration and actual tutor-model token usage, but excludes realtime sessions. It can persist on `/data`; OpenAI organization billing remains authoritative and includes realtime usage.
 - Railway serves the same Finnish Piper voice as the browser app. Android falls back to its best installed `fi-FI` voice if neural speech is unavailable.
 - Railway hosting and OpenAI API usage are billed separately.
+- RT puhe uses the configured OpenAI realtime model and its audio pricing rather than Piper or Android text-to-speech. Stop the session when finished to release the microphone and connection.
 - For personal use, the app key plus Railway/OpenAI limits is reasonable. Before public distribution, add user authentication, database-backed quotas, abuse monitoring, and per-user rate limits.
 - Recordings are temporary files and are deleted after each request, but their audio is sent to OpenAI for transcription.
 

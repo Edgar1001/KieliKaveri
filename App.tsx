@@ -2,12 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   KeyboardAvoidingView,
+  Keyboard,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import {
@@ -26,17 +30,24 @@ import * as Speech from 'expo-speech';
 import {
   ChevronDown,
   ChevronUp,
+  ExternalLink,
+  Radio,
+  AudioLines,
   Mic,
+  MessageSquare,
+  Send,
   RotateCcw,
-  Sparkles,
   Square,
   Volume2,
 } from 'lucide-react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import RealtimeConversation from './RealtimeConversation';
+import { AutoSpeechDetector } from './autoSpeech';
 
 type Level = 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 type LanguageMode = 'Puhekieli' | 'Kirjakieli';
+type ConversationMode = 'voice' | 'text' | 'realtime' | 'automatic';
 
 type Turn = {
   id: string;
@@ -68,7 +79,9 @@ let webSpeechAudio: HTMLAudioElement | null = null;
 let webSpeechRequest: AbortController | null = null;
 const SPEECH_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
+  directory: 'document' as const,
   numberOfChannels: 1,
+  isMeteringEnabled: true,
   android: {
     ...RecordingPresets.HIGH_QUALITY.android,
     audioSource: 'unprocessed' as const,
@@ -81,13 +94,87 @@ export default function App() {
   const recorderState = useAudioRecorderState(recorder, 100);
   const scrollRef = useRef<ScrollView>(null);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopAndSendInProgressRef = useRef(false);
   const finnishVoiceRef = useRef<string | undefined>(undefined);
   const [level, setLevel] = useState<Level>('B2');
   const [languageMode, setLanguageMode] = useState<LanguageMode>('Puhekieli');
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [usageUnavailable, setUsageUnavailable] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [conversationMode, setConversationMode] = useState<ConversationMode>('voice');
+  const [draft, setDraft] = useState('');
+  const [realtimeActive, setRealtimeActive] = useState(false);
+  const textSendInProgressRef = useRef(false);
+  const [autoPhase, setAutoPhase] = useState<'off' | 'ready' | 'listening' | 'thinking' | 'speaking'>('off');
+  const autoSessionRef = useRef<AbortController | null>(null);
+  const autoDetectorRef = useRef(new AutoSpeechDetector());
+  const startingRecordingRef = useRef(false);
+  const speechEpochRef = useRef(0);
+  const playbackSubscriptionRef = useRef<{ remove: () => void } | null>(null);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active' && autoSessionRef.current) void stopAutomatic();
+    });
+    return () => {
+      subscription.remove();
+      autoSessionRef.current?.abort();
+      speechEpochRef.current += 1;
+      playbackSubscriptionRef.current?.remove();
+      void Speech.stop();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (autoPhase === 'ready' && !isProcessing && autoSessionRef.current) {
+      void startRecording(autoSessionRef.current);
+    }
+  }, [autoPhase, isProcessing]);
+
+  useEffect(() => {
+    if (autoPhase !== 'listening' || !recorderState.isRecording || recorderState.durationMillis === 0 || !autoSessionRef.current
+      || stopAndSendInProgressRef.current) return;
+    try {
+      const decision = autoDetectorRef.current.sample(recorderState.durationMillis, recorderState.metering);
+      if (decision === 'send') {
+        setAutoPhase('thinking');
+        void stopAndSend(autoSessionRef.current);
+      } else if (decision === 'discard') {
+        void stopAutomatic();
+      }
+    } catch (error) {
+      void stopAutomatic();
+      showError(error);
+    }
+  }, [autoPhase, recorderState]);
+
+  async function stopAutomatic() {
+    autoSessionRef.current?.abort();
+    autoSessionRef.current = null;
+    setAutoPhase('off');
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    recordingTimeoutRef.current = null;
+    await stopSpeaking();
+    if (recorder.isRecording && !stopAndSendInProgressRef.current) {
+      await recorder.stop();
+      if (Platform.OS !== 'web' && recorder.uri) {
+        const recording = new ExpoFile(recorder.uri);
+        if (recording.exists) recording.delete();
+      }
+    }
+  }
+
+  function startAutomatic() {
+    if (autoSessionRef.current || isProcessing || startingRecordingRef.current) return;
+    if (Platform.OS === 'web') {
+      showError(new Error('Auto puhe requires Android microphone metering. Use Puhe on the web.'));
+      return;
+    }
+    autoSessionRef.current = new AbortController();
+    setAutoPhase('ready');
+  }
 
   useEffect(() => {
     setAudioModeAsync({
@@ -123,8 +210,20 @@ export default function App() {
       });
       if (response.ok) {
         setUsage((await response.json()) as Usage);
+        setUsageUnavailable(false);
+      } else {
+        setUsageUnavailable(true);
       }
     } catch {
+      setUsageUnavailable(true);
+    }
+  }
+
+  async function openBilling() {
+    try {
+      await Linking.openURL('https://platform.openai.com/settings/organization/billing/overview');
+    } catch {
+      Alert.alert('Could not open billing', 'Please open the OpenAI billing dashboard in your browser.');
     }
   }
 
@@ -134,11 +233,16 @@ export default function App() {
     return () => clearInterval(usageInterval);
   }, []);
 
-  async function startRecording() {
+  async function startRecording(automatic?: AbortController) {
+    if (stopAndSendInProgressRef.current || isProcessing || startingRecordingRef.current) {
+      return;
+    }
+    startingRecordingRef.current = true;
     try {
       await stopSpeaking();
       const permission = await AudioModule.requestRecordingPermissionsAsync();
       if (!permission.granted) {
+        if (automatic) void stopAutomatic();
         Alert.alert(
           'Microphone access needed',
           'Enable microphone access to practise speaking Finnish.',
@@ -147,38 +251,71 @@ export default function App() {
       }
 
       await setAudioModeAsync({ allowsRecording: true });
+      if (automatic?.signal.aborted) return;
       await recorder.prepareToRecordAsync();
+      if (automatic?.signal.aborted) {
+        await recorder.stop();
+        return;
+      }
       recorder.record();
+      if (automatic) {
+        autoDetectorRef.current = new AutoSpeechDetector();
+        setAutoPhase('listening');
+      }
       recordingTimeoutRef.current = setTimeout(() => {
         recordingTimeoutRef.current = null;
-        void stopAndSend();
+        if (automatic) {
+          if (automatic.signal.aborted) return;
+          try {
+            if (autoDetectorRef.current.sample(60_000, recorder.getStatus().metering) === 'send') {
+              setAutoPhase('thinking');
+              void stopAndSend(automatic);
+            } else void stopAutomatic();
+          } catch (error) {
+            void stopAutomatic();
+            showError(error);
+          }
+        } else void stopAndSend();
       }, 60_000);
     } catch (error) {
+      if (automatic) void stopAutomatic();
       showError(error);
+    } finally {
+      startingRecordingRef.current = false;
     }
   }
 
-  async function stopAndSend() {
+  async function stopAndSend(automatic?: AbortController) {
+    if (stopAndSendInProgressRef.current) {
+      return;
+    }
+    stopAndSendInProgressRef.current = true;
+    setIsProcessing(true);
     if (recordingTimeoutRef.current) {
       clearTimeout(recordingTimeoutRef.current);
       recordingTimeoutRef.current = null;
     }
 
+    let recordingFile: ExpoFile | null = null;
+    let requestStarted = false;
     try {
-      const audioDurationMs = recorderState.durationMillis;
+      const audioDurationMs = recorder.getStatus().durationMillis;
       await recorder.stop();
       const audioUri = recorder.uri;
       if (!audioUri) {
         throw new Error('The recording could not be saved. Please try again.');
       }
 
-      setIsProcessing(true);
       const formData = new FormData();
       if (Platform.OS === 'web') {
         const audioBlob = await globalThis.fetch(audioUri).then((response) => response.blob());
         formData.append('audio', audioBlob, 'speech.webm');
       } else {
-        formData.append('audio', new ExpoFile(audioUri));
+        recordingFile = new ExpoFile(audioUri);
+        if (!recordingFile.exists || recordingFile.size === 0) {
+          throw new Error('The recording file was lost. Please record again.');
+        }
+        formData.append('audio', recordingFile);
       }
       formData.append('topic', 'Arki');
       formData.append('level', level);
@@ -189,15 +326,18 @@ export default function App() {
         JSON.stringify(turns.slice(-4).map(({ transcript, reply }) => ({ transcript, reply }))),
       );
 
+      requestStarted = true;
       const response = await fetch(`${API_URL}/api/conversation`, {
         method: 'POST',
         headers: { 'X-App-Key': APP_API_KEY },
         body: formData,
+        signal: automatic?.signal,
       });
       const result = (await response.json()) as TutorResponse | { error: string };
       if (!response.ok || 'error' in result) {
         throw new TutorResponseError('error' in result ? result.error : 'The tutor could not answer.');
       }
+      if (automatic?.signal.aborted) return;
 
       const turn = { ...result, id: `${Date.now()}` };
       setTurns((current) => [...current, turn]);
@@ -208,24 +348,89 @@ export default function App() {
         interruptionMode: 'doNotMix',
         shouldRouteThroughEarpiece: false,
       });
-      speak(turn.reply);
+      if (automatic?.signal.aborted) return;
+      if (automatic) setAutoPhase('speaking');
+      speak(turn.reply, automatic ? () => {
+        if (!automatic.signal.aborted) setAutoPhase('ready');
+      } : undefined);
       requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
     } catch (error) {
-      showError(error);
+      if (!automatic?.signal.aborted) {
+        if (automatic) void stopAutomatic();
+        showError(error, requestStarted);
+      }
     } finally {
+      stopAndSendInProgressRef.current = false;
+      setIsProcessing(false);
+      if (recordingFile?.exists) {
+        try {
+          recordingFile.delete();
+        } catch {
+        }
+      }
+    }
+  }
+
+  async function sendText() {
+    const text = draft.trim();
+    if (!text || isProcessing || textSendInProgressRef.current) {
+      return;
+    }
+    textSendInProgressRef.current = true;
+    setIsProcessing(true);
+    Keyboard.dismiss();
+    try {
+      const formData = new FormData();
+      formData.append('text', text);
+      formData.append('topic', 'Arki');
+      formData.append('level', level);
+      formData.append('languageMode', languageMode);
+      formData.append(
+        'history',
+        JSON.stringify(turns.slice(-4).map(({ transcript, reply }) => ({ transcript, reply }))),
+      );
+      const response = await fetch(`${API_URL}/api/conversation`, {
+        method: 'POST',
+        headers: { 'X-App-Key': APP_API_KEY },
+        body: formData,
+      });
+      const result = (await response.json()) as TutorResponse | { error: string };
+      if (!response.ok || 'error' in result) {
+        throw new TutorResponseError('error' in result ? result.error : 'The tutor could not answer.');
+      }
+      setTurns((current) => [...current, { ...result, id: `${Date.now()}` }]);
+      setDraft('');
+      void refreshUsage();
+    } catch (error) {
+      showError(error, true);
+    } finally {
+      textSendInProgressRef.current = false;
       setIsProcessing(false);
     }
   }
 
-  function showError(error: unknown) {
+  async function switchConversationMode(mode: ConversationMode) {
+    if ((!autoSessionRef.current && (isProcessing || recorderState.isRecording)) || mode === conversationMode) {
+      return;
+    }
+    if (autoSessionRef.current) await stopAutomatic();
+    await stopSpeaking();
+    Keyboard.dismiss();
+    setConversationMode(mode);
+  }
+
+  function showError(error: unknown, requestStarted = false) {
     const message = error instanceof Error ? error.message : 'Something went wrong.';
-    const apiHint = error instanceof TutorResponseError
+    const apiHint = !requestStarted || error instanceof TutorResponseError
       ? ''
       : `\n\nCheck that the tutor API is running at ${API_URL}.`;
     Alert.alert('Could not continue', `${message}${apiHint}`);
   }
 
   async function stopSpeaking() {
+    speechEpochRef.current += 1;
+    playbackSubscriptionRef.current?.remove();
+    playbackSubscriptionRef.current = null;
     if (Platform.OS === 'web') {
       webSpeechRequest?.abort();
       webSpeechRequest = null;
@@ -241,11 +446,20 @@ export default function App() {
   }
 
   async function restartConversation() {
+    if (autoSessionRef.current) await stopAutomatic();
     await stopSpeaking();
     setTurns([]);
+    setDraft('');
   }
 
-  function speak(text: string) {
+  function speak(text: string, onComplete?: () => void) {
+    const playbackFailed = (error: unknown) => {
+      console.warn('Finnish playback failed.', error);
+      if (onComplete && autoSessionRef.current) {
+        void stopAutomatic();
+        showError(error);
+      }
+    };
     if (Platform.OS === 'web') {
       void stopSpeaking().then(async () => {
         const request = new AbortController();
@@ -284,23 +498,20 @@ export default function App() {
       return;
     }
     if (!finnishVoiceRef.current) {
-      void playNeuralSpeech(text).catch((error: unknown) => {
-        console.warn('Neural Finnish playback failed.', error);
-      });
+      void stopSpeaking().then(() => playNeuralSpeech(text, onComplete)).catch(playbackFailed);
       return;
     }
     void stopSpeaking().then(() => {
+      const epoch = speechEpochRef.current;
       let fallbackStarted = false;
       let speechStarted = false;
       const fallbackToNeuralSpeech = () => {
-        if (fallbackStarted || speechStarted) {
+        if (fallbackStarted || speechStarted || epoch !== speechEpochRef.current) {
           return;
         }
         fallbackStarted = true;
         console.warn('Android speech did not start; trying neural audio.');
-        void playNeuralSpeech(text).catch((error: unknown) => {
-          console.warn('Neural Finnish playback failed.', error);
-        });
+        void Speech.stop().then(() => playNeuralSpeech(text, onComplete)).catch(playbackFailed);
       };
       const fallbackTimer = setTimeout(fallbackToNeuralSpeech, 3000);
       Speech.speak(text, {
@@ -317,25 +528,24 @@ export default function App() {
         onDone: () => {
           clearTimeout(fallbackTimer);
           console.info('Finnish Android speech finished.');
+          if (epoch === speechEpochRef.current && !fallbackStarted) onComplete?.();
         },
         onError: (error) => {
           clearTimeout(fallbackTimer);
+          if (epoch !== speechEpochRef.current || fallbackStarted) return;
           console.warn('Android Finnish speech failed; trying neural audio.', error);
           fallbackStarted = true;
-          void playNeuralSpeech(text).catch((fallbackError: unknown) => {
-            console.warn('Neural Finnish playback failed.', fallbackError);
-          });
+          void playNeuralSpeech(text, onComplete).catch(playbackFailed);
         },
       });
     }).catch((error: unknown) => {
       console.warn('Android speech setup failed; trying neural audio.', error);
-      void playNeuralSpeech(text).catch((fallbackError: unknown) => {
-        console.warn('Neural Finnish playback failed.', fallbackError);
-      });
+      void playNeuralSpeech(text, onComplete).catch(playbackFailed);
     });
   }
 
-  async function playNeuralSpeech(text: string) {
+  async function playNeuralSpeech(text: string, onComplete?: () => void) {
+    const epoch = speechEpochRef.current;
     const response = await fetch(`${API_URL}/api/speech`, {
       method: 'POST',
       headers: {
@@ -347,8 +557,11 @@ export default function App() {
     if (!response.ok) {
       throw new Error('Finnish neural speech is unavailable.');
     }
+    if (epoch !== speechEpochRef.current) return;
     const speechFile = new ExpoFile(Paths.cache, `kielikaveri-speech-${Date.now()}.wav`);
-    speechFile.write(await response.bytes());
+    const audioBytes = await response.bytes();
+    if (epoch !== speechEpochRef.current) return;
+    speechFile.write(audioBytes);
     speechPlayer.volume = 1;
     speechPlayer.replace(speechFile.uri);
     for (let attempt = 0; attempt < 100 && !speechPlayer.isLoaded; attempt += 1) {
@@ -357,6 +570,19 @@ export default function App() {
     if (!speechPlayer.isLoaded) {
       throw new Error('Finnish neural speech could not be loaded.');
     }
+    if (epoch !== speechEpochRef.current) return;
+    playbackSubscriptionRef.current = speechPlayer.addListener('playbackStatusUpdate', (status) => {
+      if (status.didJustFinish || status.error) {
+        playbackSubscriptionRef.current?.remove();
+        playbackSubscriptionRef.current = null;
+        if (speechFile.exists) speechFile.delete();
+        if (epoch !== speechEpochRef.current) return;
+        if (status.error) {
+          if (onComplete) void stopAutomatic();
+          showError(new Error(status.error));
+        } else onComplete?.();
+      }
+    });
     speechPlayer.play();
   }
 
@@ -377,30 +603,66 @@ export default function App() {
           <View style={styles.header}>
             <View>
               <Text style={styles.eyebrow}>PUHEKAVERI</Text>
-              <Text style={styles.title}>Finnish, out loud.</Text>
+              <Text style={styles.title}>{conversationMode === 'text' ? 'Finnish, in words.' : 'Finnish, out loud.'}</Text>
             </View>
-            <View style={styles.levelBadge}>
-              <Sparkles color="#F7C948" size={16} strokeWidth={2.4} />
-              <Text style={styles.levelText}>{level}</Text>
+            <View style={styles.headerActions}>
+              <View accessibilityRole="tablist" style={styles.conversationSelector}>
+                {(['voice', 'text', 'automatic', 'realtime'] as const).map((mode) => (
+                  <Pressable
+                    key={mode}
+                    accessibilityRole="tab"
+                    accessibilityLabel={mode === 'voice' ? 'Voice conversation' : mode === 'text' ? 'Written conversation' : mode === 'automatic' ? 'Automatic voice conversation' : 'Realtime voice conversation'}
+                    accessibilityState={{ selected: conversationMode === mode }}
+                    disabled={!autoSessionRef.current && (isProcessing || recorderState.isRecording)}
+                    onPress={() => void switchConversationMode(mode)}
+                    style={[styles.conversationTab, conversationMode === mode && styles.compactButtonActive]}
+                  >
+                    {mode === 'voice'
+                      ? <Mic size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />
+                      : mode === 'text'
+                        ? <MessageSquare size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />
+                        : mode === 'automatic'
+                          ? <AudioLines size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />
+                          : <Radio size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />}
+                    <Text style={[styles.compactText, conversationMode === mode && styles.compactTextActive]}>
+                      {mode === 'voice' ? 'Puhe' : mode === 'text' ? 'Viestit' : mode === 'automatic' ? 'Auto puhe' : 'RT puhe'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
             </View>
           </View>
 
-          {usage && (
-            <View accessibilityLabel="Estimated OpenAI budget usage" style={styles.usagePanel}>
+            <View accessibilityLabel="OpenAI spending" style={styles.usagePanel}>
               <View style={styles.usageHeader}>
-                <Text style={styles.usageLabel}>ARVIOITU API-KÄYTTÖ</Text>
-                <Text style={styles.usageValue}>
-                  {usage.percentage.toFixed(2)}%  (${usage.estimatedSpendUsd.toFixed(4)} / ${usage.budgetUsd.toFixed(2)})
+                <Text style={styles.usageLabel}>
+                  {usage?.scope === 'OpenAI Platform, current month' ? 'KULUT TÄSSÄ KUUSSA' : 'SOVELLUKSEN KULUARVIO'}
                 </Text>
+                <View style={styles.usageActions}>
+                  <Text style={styles.usageValue}>
+                    {usage ? `$${usage.estimatedSpendUsd.toFixed(2)}` : usageUnavailable ? 'Ei saatavilla' : '...'}
+                  </Text>
+                  <Pressable
+                    accessibilityRole="link"
+                    accessibilityLabel="Open OpenAI billing dashboard"
+                    onPress={() => void openBilling()}
+                    style={styles.billingButton}
+                  >
+                    <ExternalLink color="#31564D" size={18} />
+                  </Pressable>
+                </View>
               </View>
-              <View style={styles.usageTrack}>
-                <View style={[styles.usageFill, { width: `${usage.percentage}%` }]} />
-              </View>
+              {usage && <View style={styles.usageTrack}>
+                <View style={[styles.usageFill, {
+                  width: `${Math.max(0, Math.min(100, usage.percentage))}%`,
+                }]} />
+              </View>}
               <Text style={styles.usageScope}>
-                {usage.completedTurns} vastausta · {usage.transcriptionMinutes.toFixed(1)} min · {usage.scope === 'persistent estimate' ? 'tallennettu arvio' : 'nykyinen käyttökerta'}
+                {usage
+                  ? `${usage.scope === 'OpenAI Platform, current month' ? 'OpenAI-organisaatio' : 'Vain tämä sovellus'} · budjetti $${usage.budgetUsd.toFixed(2)}${usageUnavailable ? ' · vanhentunut' : ''}`
+                  : 'OpenAI'}
               </Text>
             </View>
-          )}
 
           <View style={styles.practiceSettings}>
             <Pressable
@@ -425,7 +687,7 @@ export default function App() {
                       <Pressable
                         accessibilityRole="tab"
                         accessibilityState={{ selected: level === item }}
-                        disabled={isProcessing || recorderState.isRecording}
+                        disabled={isProcessing || recorderState.isRecording || realtimeActive || autoPhase !== 'off'}
                         key={item}
                         onPress={() => setLevel(item)}
                         style={[styles.compactButton, level === item && styles.compactButtonActive]}
@@ -445,7 +707,7 @@ export default function App() {
                       <Pressable
                         accessibilityRole="tab"
                         accessibilityState={{ selected: languageMode === item }}
-                        disabled={isProcessing || recorderState.isRecording}
+                        disabled={isProcessing || recorderState.isRecording || realtimeActive || autoPhase !== 'off'}
                         key={item}
                         onPress={() => setLanguageMode(item)}
                         style={[styles.modeButton, languageMode === item && styles.compactButtonActive]}
@@ -463,8 +725,28 @@ export default function App() {
             )}
           </View>
 
+          {conversationMode === 'realtime' ? (
+            <RealtimeConversation
+              apiUrl={API_URL}
+              appKey={APP_API_KEY}
+              level={level}
+              languageMode={languageMode}
+              history={turns}
+              onActiveChange={setRealtimeActive}
+              onTurn={(transcript, reply) => {
+                setTurns((current) => [...current, {
+                  id: `${Date.now()}`, transcript, reply,
+                  correctedText: transcript, explanation: '', translation: '',
+                }]);
+                void refreshUsage();
+              }}
+            />
+          ) : <>
           <ScrollView
+            style={styles.conversationScroll}
             contentContainerStyle={styles.conversation}
+            keyboardShouldPersistTaps="handled"
+            onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
             ref={scrollRef}
             showsVerticalScrollIndicator={false}
           >
@@ -476,31 +758,31 @@ export default function App() {
                 <Text style={styles.speaker}>KIELIKAVERI</Text>
                 <Text style={styles.reply}>{openingQuestion}</Text>
                 <Text style={styles.translation}>Hi! How are you today?</Text>
-                <Pressable
+                {conversationMode === 'voice' && <Pressable
                   accessibilityLabel="Play the opening tutor message"
                   hitSlop={12}
                   onPress={() => speak(openingQuestion)}
                   style={styles.replayButton}
                 >
                   <Volume2 color="#165B4D" size={19} />
-                </Pressable>
+                </Pressable>}
               </View>
             </View>
 
             {turns.map((turn) => (
               <View key={turn.id} style={styles.turnBlock}>
                 <View style={styles.userMessage}>
-                  <Text style={styles.speakerLight}>SINÄ SANOIT</Text>
+                  <Text style={styles.speakerLight}>{conversationMode === 'voice' ? 'SINÄ SANOIT' : 'SINÄ'}</Text>
                   <Text style={styles.userText}>{turn.transcript}</Text>
                 </View>
 
-                <View style={styles.feedback}>
+                {turn.explanation !== '' && <View style={styles.feedback}>
                   <Text style={styles.feedbackLabel}>
                     {turn.correctedText === turn.transcript ? 'HYVIN SANOTTU' : 'KORJAUS'}
                   </Text>
                   <Text style={styles.correctedText}>{turn.correctedText}</Text>
                   <Text style={styles.explanation}>{turn.explanation}</Text>
-                </View>
+                </View>}
 
                 <View style={styles.tutorMessage}>
                   <View style={styles.avatar}>
@@ -510,14 +792,14 @@ export default function App() {
                     <Text style={styles.speaker}>KIELIKAVERI</Text>
                     <Text style={styles.reply}>{turn.reply}</Text>
                     <Text style={styles.translation}>{turn.translation}</Text>
-                    <Pressable
+                    {conversationMode === 'voice' && <Pressable
                       accessibilityLabel="Play the tutor reply again"
                       hitSlop={12}
                       onPress={() => speak(turn.reply)}
                       style={styles.replayButton}
                     >
                       <Volume2 color="#165B4D" size={19} />
-                    </Pressable>
+                    </Pressable>}
                   </View>
                 </View>
               </View>
@@ -526,12 +808,66 @@ export default function App() {
             {isProcessing && (
               <View style={styles.thinkingRow}>
                 <ActivityIndicator color="#165B4D" />
-                <Text style={styles.thinkingText}>Kuuntelen ja mietin...</Text>
+                <Text style={styles.thinkingText}>{conversationMode === 'voice' ? 'Kuuntelen ja mietin...' : 'Mietin vastausta...'}</Text>
               </View>
             )}
           </ScrollView>
 
           <View style={styles.controls}>
+            {conversationMode === 'text' ? (
+              <View style={styles.writtenControls}>
+                <View style={styles.composer}>
+                  <TextInput
+                    accessibilityLabel="Written Finnish message"
+                    placeholder="Viesti suomeksi..."
+                    placeholderTextColor="#71847E"
+                    value={draft}
+                    onChangeText={setDraft}
+                    editable={!isProcessing}
+                    multiline
+                    maxLength={4000}
+                    style={styles.textInput}
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Send written message"
+                    disabled={!draft.trim() || isProcessing}
+                    onPress={() => void sendText()}
+                    style={[styles.sendButton, (!draft.trim() || isProcessing) && styles.disabled]}
+                  >
+                    {isProcessing
+                      ? <ActivityIndicator color="#FFFDF7" />
+                      : <Send color="#FFFDF7" size={21} />}
+                  </Pressable>
+                </View>
+                <Pressable
+                  accessibilityLabel="Start a new conversation"
+                  disabled={isProcessing}
+                  onPress={() => void restartConversation()}
+                  style={styles.writtenRestart}
+                >
+                  <RotateCcw color="#31564D" size={17} />
+                  <Text style={styles.restartButtonText}>Uusi keskustelu</Text>
+                </Pressable>
+              </View>
+            ) : conversationMode === 'automatic' ? <>
+              <Text accessibilityLiveRegion="polite" style={styles.recordingHint}>
+                {autoPhase === 'listening' ? 'Kuuntelen...' : autoPhase === 'thinking' ? 'Rakennan vastausta' : autoPhase === 'speaking' ? 'Kielikaveri puhuu...' : autoPhase === 'ready' ? 'Valmistaudutaan...' : 'Valmis'}
+              </Text>
+              <View style={styles.automaticControlRow}>
+                <Pressable accessibilityRole="button" accessibilityLabel={autoPhase === 'off' ? 'Start automatic conversation' : 'Stop automatic conversation'}
+                  disabled={autoPhase === 'off' && isProcessing}
+                  onPress={() => autoPhase === 'off' ? startAutomatic() : void stopAutomatic()}
+                  style={[styles.automaticButton, autoPhase !== 'off' && styles.compactButtonActive]}>
+                  {autoPhase === 'off' ? <AudioLines color="#31564D" size={20} /> : <Square color="#FFFDF7" size={20} />}
+                  <Text style={[styles.restartButtonText, autoPhase !== 'off' && styles.compactTextActive]}>{autoPhase === 'off' ? 'Aloita Auto puhe' : 'Lopeta'}</Text>
+                </Pressable>
+                <Pressable accessibilityLabel="Start a new conversation" disabled={isProcessing} onPress={() => void restartConversation()} style={styles.automaticButton}>
+                  <RotateCcw color="#31564D" size={17} />
+                  <Text style={styles.restartButtonText}>Uusi keskustelu</Text>
+                </Pressable>
+              </View>
+            </> : <>
             <Text style={styles.recordingHint}>
               {recorderState.isRecording
                 ? `Puhut nyt  0:${seconds.toString().padStart(2, '0')}`
@@ -543,7 +879,7 @@ export default function App() {
               <Pressable
                 accessibilityLabel={recorderState.isRecording ? 'Stop recording' : 'Start recording'}
                 disabled={isProcessing}
-                onPress={recorderState.isRecording ? stopAndSend : startRecording}
+                onPress={() => recorderState.isRecording ? void stopAndSend() : void startRecording()}
                 style={({ pressed }) => [
                   styles.micButton,
                   recorderState.isRecording && styles.micButtonRecording,
@@ -559,21 +895,23 @@ export default function App() {
                   <Mic color="#FFFDF7" size={34} strokeWidth={2.2} />
                 )}
               </Pressable>
+              <Pressable
+                accessibilityLabel="Start a new conversation"
+                disabled={isProcessing || recorderState.isRecording}
+                onPress={() => void restartConversation()}
+                style={({ pressed }) => [
+                  styles.restartButton,
+                  pressed && styles.restartButtonPressed,
+                  (isProcessing || recorderState.isRecording) && styles.disabled,
+                ]}
+              >
+                <RotateCcw color="#31564D" size={17} />
+                <Text style={styles.restartButtonText}>Uusi keskustelu</Text>
+              </Pressable>
             </View>
-            <Pressable
-              accessibilityLabel="Start a new conversation"
-              disabled={isProcessing || recorderState.isRecording}
-              onPress={() => void restartConversation()}
-              style={({ pressed }) => [
-                styles.restartButton,
-                pressed && styles.restartButtonPressed,
-                (isProcessing || recorderState.isRecording) && styles.disabled,
-              ]}
-            >
-              <RotateCcw color="#31564D" size={18} />
-              <Text style={styles.restartButtonText}>Uusi keskustelu</Text>
-            </Pressable>
+            </>}
           </View>
+          </>}
           </KeyboardAvoidingView>
         </SafeAreaView>
       </LinearGradient>
@@ -587,6 +925,8 @@ const styles = StyleSheet.create({
   header: {
     alignItems: 'center',
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
     justifyContent: 'space-between',
     paddingHorizontal: 24,
     paddingBottom: 18,
@@ -594,18 +934,37 @@ const styles = StyleSheet.create({
   },
   eyebrow: { color: '#C64B38', fontSize: 11, fontWeight: '800', letterSpacing: 0 },
   title: { color: '#173E35', fontFamily: 'serif', fontSize: 31, fontWeight: '700', marginTop: 3 },
-  levelBadge: {
-    alignItems: 'center',
-    backgroundColor: '#173E35',
-    borderRadius: 8,
-    flexDirection: 'row',
-    gap: 6,
-    paddingHorizontal: 11,
-    paddingVertical: 8,
+  headerActions: {
+    alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between',
+    gap: 8, width: '100%',
   },
-  levelText: { color: '#FFFDF7', fontSize: 13, fontWeight: '800' },
+  conversationSelector: {
+    flex: 1, minWidth: 0, flexShrink: 1, flexWrap: 'wrap', flexDirection: 'row', backgroundColor: '#DDECE6', borderRadius: 8, padding: 3,
+  },
+  conversationTab: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    gap: 5, minHeight: 36, paddingHorizontal: 8, borderRadius: 6,
+  },
+  conversationScroll: { flex: 1 },
+  writtenControls: { width: '100%', paddingHorizontal: 22, gap: 10 },
+  composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
+  textInput: {
+    flex: 1, minHeight: 48, maxHeight: 120, borderColor: '#B8C7C1', borderWidth: 1,
+    borderRadius: 8, paddingHorizontal: 12, paddingVertical: 12, fontSize: 16,
+    color: '#173E35', backgroundColor: '#FFFDF7', textAlignVertical: 'top',
+  },
+  sendButton: {
+    width: 48, height: 48, borderRadius: 8, backgroundColor: '#165B4D',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  writtenRestart: {
+    alignSelf: 'flex-end', flexDirection: 'row', alignItems: 'center',
+    gap: 5, minHeight: 36,
+  },
   usagePanel: { paddingBottom: 10, paddingHorizontal: 22 },
   usageHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  usageActions: { alignItems: 'center', flexDirection: 'row', gap: 6 },
+  billingButton: { alignItems: 'center', justifyContent: 'center', height: 36, width: 36 },
   usageLabel: { color: '#587068', fontSize: 9, fontWeight: '900' },
   usageValue: { color: '#31564D', fontSize: 11, fontWeight: '800' },
   usageTrack: { backgroundColor: '#DCE5DE', borderRadius: 3, height: 5, marginTop: 5, overflow: 'hidden' },
@@ -711,7 +1070,21 @@ const styles = StyleSheet.create({
     paddingTop: 12,
   },
   recordingHint: { color: '#587068', fontSize: 12, fontWeight: '700', marginBottom: 10 },
-  controlRow: { alignItems: 'center', flexDirection: 'row', gap: 26 },
+  controlRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'center',
+    position: 'relative',
+    width: '100%',
+  },
+  automaticControlRow: {
+    width: '100%', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center',
+    alignItems: 'center', paddingHorizontal: 20, gap: 12,
+  },
+  automaticButton: {
+    minHeight: 48, paddingHorizontal: 12, borderWidth: 1, borderColor: '#B8C7C1',
+    borderRadius: 6, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
+  },
   micButton: {
     alignItems: 'center',
     backgroundColor: '#C64B38',
@@ -734,12 +1107,13 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     borderWidth: 1,
     flexDirection: 'row',
-    gap: 8,
+    gap: 5,
     justifyContent: 'center',
-    marginTop: 12,
-    minHeight: 40,
-    paddingHorizontal: 14,
+    minHeight: 36,
+    paddingHorizontal: 8,
+    position: 'absolute',
+    right: 10,
   },
   restartButtonPressed: { backgroundColor: '#E3ECE7' },
-  restartButtonText: { color: '#31564D', fontSize: 13, fontWeight: '800' },
+  restartButtonText: { color: '#31564D', fontSize: 11, fontWeight: '800' },
 });
