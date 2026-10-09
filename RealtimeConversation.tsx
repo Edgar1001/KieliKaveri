@@ -16,7 +16,10 @@ type Props = {
 
 export default function RealtimeConversation(props: Props) {
   const [status, setStatus] = useState<'idle' | 'connecting' | 'listening' | 'speaking'>('idle');
-  const [messages, setMessages] = useState<RealtimeMessage[]>([]);
+  const [messages, setMessages] = useState<RealtimeMessage[]>(props.history.flatMap((turn, index) => [
+    { id: `saved-user-${index}`, role: 'user' as const, text: turn.transcript },
+    { id: `saved-tutor-${index}`, role: 'assistant' as const, text: turn.reply },
+  ]));
   const [error, setError] = useState('');
   const requestRef = useRef<AbortController | null>(null);
   const sessionRef = useRef<{ close: () => void } | null>(null);
@@ -61,7 +64,11 @@ export default function RealtimeConversation(props: Props) {
     requestRef.current = request;
     setError('');
     transcriptRef.current = new RealtimeTranscript();
-    setMessages([]);
+    transcriptRef.current.messages = props.history.flatMap((turn, index) => [
+      { id: `saved-user-${index}`, role: 'user' as const, text: turn.transcript },
+      { id: `saved-tutor-${index}`, role: 'assistant' as const, text: turn.reply },
+    ]);
+    setMessages(transcriptRef.current.messages);
     setStatus('connecting');
     callbacksRef.current.onActiveChange(true);
     try {

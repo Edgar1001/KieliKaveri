@@ -42,6 +42,7 @@ import {
 } from 'lucide-react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import Slider from '@react-native-community/slider';
 import RealtimeConversation from './RealtimeConversation';
 import { AutoSpeechDetector } from './autoSpeech';
 
@@ -99,24 +100,37 @@ export default function App() {
   const [level, setLevel] = useState<Level>('B2');
   const [languageMode, setLanguageMode] = useState<LanguageMode>('Puhekieli');
   const [settingsExpanded, setSettingsExpanded] = useState(false);
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const [conversations, setConversations] = useState<Record<ConversationMode, Turn[]>>({
+    voice: [], text: [], automatic: [], realtime: [],
+  });
   const [usage, setUsage] = useState<Usage | null>(null);
   const [usageUnavailable, setUsageUnavailable] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [conversationMode, setConversationMode] = useState<ConversationMode>('voice');
+  const turns = conversations[conversationMode];
+  function setTurns(update: Turn[] | ((current: Turn[]) => Turn[])) {
+    const mode = conversationMode;
+    setConversations((current) => ({
+      ...current, [mode]: typeof update === 'function' ? update(current[mode]) : update,
+    }));
+  }
   const [draft, setDraft] = useState('');
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [realtimeActive, setRealtimeActive] = useState(false);
   const textSendInProgressRef = useRef(false);
   const [autoPhase, setAutoPhase] = useState<'off' | 'ready' | 'listening' | 'thinking' | 'speaking'>('off');
+  const [autoTimeoutSeconds, setAutoTimeoutSeconds] = useState(60);
+  const [autoError, setAutoError] = useState('');
   const autoSessionRef = useRef<AbortController | null>(null);
   const autoDetectorRef = useRef(new AutoSpeechDetector());
   const startingRecordingRef = useRef(false);
+  const requestingPermissionRef = useRef(false);
   const speechEpochRef = useRef(0);
   const playbackSubscriptionRef = useRef<{ remove: () => void } | null>(null);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state !== 'active' && autoSessionRef.current) void stopAutomatic();
+      if (state === 'background' && !requestingPermissionRef.current && autoSessionRef.current) void stopAutomatic();
     });
     return () => {
       subscription.remove();
@@ -126,6 +140,19 @@ export default function App() {
       void Speech.stop();
     };
   }, []);
+
+  useEffect(() => {
+    if (conversationMode !== 'text') {
+      setKeyboardVisible(false);
+      return;
+    }
+    const subscription = Keyboard.addListener('keyboardDidShow', () => {
+      setKeyboardVisible(true);
+      requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    });
+    const hidden = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
+    return () => { subscription.remove(); hidden.remove(); };
+  }, [conversationMode]);
 
   useEffect(() => {
     if (autoPhase === 'ready' && !isProcessing && autoSessionRef.current) {
@@ -142,13 +169,36 @@ export default function App() {
         setAutoPhase('thinking');
         void stopAndSend(autoSessionRef.current);
       } else if (decision === 'discard') {
-        void stopAutomatic();
+        void recycleAutomaticRecording(autoSessionRef.current);
       }
     } catch (error) {
+      setAutoError(error instanceof Error ? error.message : 'Automatic recording failed.');
       void stopAutomatic();
       showError(error);
     }
   }, [autoPhase, recorderState]);
+
+  async function recycleAutomaticRecording(session: AbortController) {
+    if (session.signal.aborted || stopAndSendInProgressRef.current) return;
+    stopAndSendInProgressRef.current = true;
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    recordingTimeoutRef.current = null;
+    try {
+      await recorder.stop();
+      if (Platform.OS !== 'web' && recorder.uri) {
+        const recording = new ExpoFile(recorder.uri);
+        if (recording.exists) recording.delete();
+      }
+      if (!session.signal.aborted) setAutoPhase('ready');
+    } catch (error) {
+      if (!session.signal.aborted) {
+        setAutoError(error instanceof Error ? error.message : 'Automatic recording could not restart.');
+        void stopAutomatic();
+      }
+    } finally {
+      stopAndSendInProgressRef.current = false;
+    }
+  }
 
   async function stopAutomatic() {
     autoSessionRef.current?.abort();
@@ -173,6 +223,7 @@ export default function App() {
       return;
     }
     autoSessionRef.current = new AbortController();
+    setAutoError('');
     setAutoPhase('ready');
   }
 
@@ -234,13 +285,20 @@ export default function App() {
   }, []);
 
   async function startRecording(automatic?: AbortController) {
+    const timeoutMillis = automatic ? autoTimeoutSeconds * 1000 : 60_000;
     if (stopAndSendInProgressRef.current || isProcessing || startingRecordingRef.current) {
       return;
     }
     startingRecordingRef.current = true;
     try {
       await stopSpeaking();
-      const permission = await AudioModule.requestRecordingPermissionsAsync();
+      requestingPermissionRef.current = true;
+      let permission;
+      try {
+        permission = await AudioModule.requestRecordingPermissionsAsync();
+      } finally {
+        requestingPermissionRef.current = false;
+      }
       if (!permission.granted) {
         if (automatic) void stopAutomatic();
         Alert.alert(
@@ -252,14 +310,14 @@ export default function App() {
 
       await setAudioModeAsync({ allowsRecording: true });
       if (automatic?.signal.aborted) return;
-      await recorder.prepareToRecordAsync();
+      await recorder.prepareToRecordAsync(SPEECH_RECORDING_OPTIONS);
       if (automatic?.signal.aborted) {
         await recorder.stop();
         return;
       }
       recorder.record();
       if (automatic) {
-        autoDetectorRef.current = new AutoSpeechDetector();
+        autoDetectorRef.current = new AutoSpeechDetector(timeoutMillis);
         setAutoPhase('listening');
       }
       recordingTimeoutRef.current = setTimeout(() => {
@@ -267,18 +325,21 @@ export default function App() {
         if (automatic) {
           if (automatic.signal.aborted) return;
           try {
-            if (autoDetectorRef.current.sample(60_000, recorder.getStatus().metering) === 'send') {
+            if (autoDetectorRef.current.sample(timeoutMillis, recorder.getStatus().metering) === 'send') {
               setAutoPhase('thinking');
               void stopAndSend(automatic);
-            } else void stopAutomatic();
+            } else void recycleAutomaticRecording(automatic);
           } catch (error) {
             void stopAutomatic();
             showError(error);
           }
         } else void stopAndSend();
-      }, 60_000);
+      }, timeoutMillis);
     } catch (error) {
-      if (automatic) void stopAutomatic();
+      if (automatic) {
+        setAutoError(error instanceof Error ? error.message : 'Automatic recording could not start.');
+        void stopAutomatic();
+      }
       showError(error);
     } finally {
       startingRecordingRef.current = false;
@@ -356,8 +417,13 @@ export default function App() {
       requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
     } catch (error) {
       if (!automatic?.signal.aborted) {
-        if (automatic) void stopAutomatic();
-        showError(error, requestStarted);
+        if (automatic && error instanceof TutorResponseError && error.message === 'No Finnish speech was detected. Please try again.') {
+          setAutoPhase('ready');
+          void refreshUsage();
+        } else {
+          if (automatic) void stopAutomatic();
+          showError(error, requestStarted);
+        }
       }
     } finally {
       stopAndSendInProgressRef.current = false;
@@ -595,9 +661,9 @@ export default function App() {
     <SafeAreaProvider>
       <LinearGradient colors={['#F4F0E6', '#F8FAF4', '#E6F2ED']} style={styles.background}>
         <StatusBar style="dark" />
-        <SafeAreaView style={styles.safeArea}>
+        <SafeAreaView edges={conversationMode === 'realtime' ? undefined : ['top', 'left', 'right']} style={styles.safeArea}>
           <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             style={styles.safeArea}
           >
           <View style={styles.header}>
@@ -615,7 +681,7 @@ export default function App() {
                     accessibilityState={{ selected: conversationMode === mode }}
                     disabled={!autoSessionRef.current && (isProcessing || recorderState.isRecording)}
                     onPress={() => void switchConversationMode(mode)}
-                    style={[styles.conversationTab, conversationMode === mode && styles.compactButtonActive]}
+                    style={[styles.conversationTab, (mode === 'automatic' || mode === 'realtime') && styles.longConversationTab, conversationMode === mode && styles.compactButtonActive]}
                   >
                     {mode === 'voice'
                       ? <Mic size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />
@@ -624,7 +690,7 @@ export default function App() {
                         : mode === 'automatic'
                           ? <AudioLines size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />
                           : <Radio size={16} color={conversationMode === mode ? '#FFFDF7' : '#31564D'} />}
-                    <Text style={[styles.compactText, conversationMode === mode && styles.compactTextActive]}>
+                    <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={[styles.compactText, styles.conversationTabText, conversationMode === mode && styles.compactTextActive]}>
                       {mode === 'voice' ? 'Puhe' : mode === 'text' ? 'Viestit' : mode === 'automatic' ? 'Auto puhe' : 'RT puhe'}
                     </Text>
                   </Pressable>
@@ -633,7 +699,7 @@ export default function App() {
             </View>
           </View>
 
-            <View accessibilityLabel="OpenAI spending" style={styles.usagePanel}>
+            {!keyboardVisible && <View accessibilityLabel="OpenAI spending" style={styles.usagePanel}>
               <View style={styles.usageHeader}>
                 <Text style={styles.usageLabel}>
                   {usage?.scope === 'OpenAI Platform, current month' ? 'KULUT TÄSSÄ KUUSSA' : 'SOVELLUKSEN KULUARVIO'}
@@ -662,9 +728,9 @@ export default function App() {
                   ? `${usage.scope === 'OpenAI Platform, current month' ? 'OpenAI-organisaatio' : 'Vain tämä sovellus'} · budjetti $${usage.budgetUsd.toFixed(2)}${usageUnavailable ? ' · vanhentunut' : ''}`
                   : 'OpenAI'}
               </Text>
-            </View>
+            </View>}
 
-          <View style={styles.practiceSettings}>
+          {!keyboardVisible && <View style={styles.practiceSettings}>
             <Pressable
               accessibilityLabel={settingsExpanded ? 'Collapse practice settings' : 'Expand practice settings'}
               accessibilityRole="button"
@@ -723,7 +789,23 @@ export default function App() {
                 </View>
               </View>
             )}
-          </View>
+          </View>}
+
+          {conversationMode === 'automatic' && <View style={styles.automaticTimeout}>
+            <Text style={styles.automaticTimeoutLabel}>Vastausaika: {autoTimeoutSeconds} s</Text>
+            <Slider
+              accessibilityLabel="Automatic reply timeout"
+              minimumValue={10}
+              maximumValue={60}
+              step={1}
+              value={autoTimeoutSeconds}
+              onValueChange={setAutoTimeoutSeconds}
+              minimumTrackTintColor="#31564D"
+              maximumTrackTintColor="#DDECE6"
+              thumbTintColor="#31564D"
+              style={styles.automaticTimeoutSlider}
+            />
+          </View>}
 
           {conversationMode === 'realtime' ? (
             <RealtimeConversation
@@ -747,6 +829,7 @@ export default function App() {
             contentContainerStyle={styles.conversation}
             keyboardShouldPersistTaps="handled"
             onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+            onLayout={() => scrollRef.current?.scrollToEnd({ animated: false })}
             ref={scrollRef}
             showsVerticalScrollIndicator={false}
           >
@@ -813,7 +896,11 @@ export default function App() {
             )}
           </ScrollView>
 
-          <View style={styles.controls}>
+          <SafeAreaView
+            accessibilityLabel="Conversation controls"
+            edges={conversationMode === 'text' && keyboardVisible ? [] : ['bottom']}
+            style={[styles.controls, conversationMode === 'text' && keyboardVisible && styles.writtenKeyboardControls]}
+          >
             {conversationMode === 'text' ? (
               <View style={styles.writtenControls}>
                 <View style={styles.composer}>
@@ -851,6 +938,7 @@ export default function App() {
                 </Pressable>
               </View>
             ) : conversationMode === 'automatic' ? <>
+              {autoError !== '' && <Text accessibilityRole="alert" style={styles.automaticError}>{autoError}</Text>}
               <Text accessibilityLiveRegion="polite" style={styles.recordingHint}>
                 {autoPhase === 'listening' ? 'Kuuntelen...' : autoPhase === 'thinking' ? 'Rakennan vastausta' : autoPhase === 'speaking' ? 'Kielikaveri puhuu...' : autoPhase === 'ready' ? 'Valmistaudutaan...' : 'Valmis'}
               </Text>
@@ -910,7 +998,7 @@ export default function App() {
               </Pressable>
             </View>
             </>}
-          </View>
+          </SafeAreaView>
           </>}
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -920,6 +1008,9 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  automaticTimeout: { width: '100%', maxWidth: 400, alignSelf: 'center', paddingHorizontal: 24 },
+  automaticTimeoutLabel: { color: '#587068', fontSize: 12, fontWeight: '700' },
+  automaticTimeoutSlider: { width: '100%', height: 40 },
   background: { flex: 1 },
   safeArea: { flex: 1 },
   header: {
@@ -939,12 +1030,14 @@ const styles = StyleSheet.create({
     gap: 8, width: '100%',
   },
   conversationSelector: {
-    flex: 1, minWidth: 0, flexShrink: 1, flexWrap: 'wrap', flexDirection: 'row', backgroundColor: '#DDECE6', borderRadius: 8, padding: 3,
+    flex: 1, minWidth: 0, flexDirection: 'row', backgroundColor: '#DDECE6', borderRadius: 8, padding: 2,
   },
   conversationTab: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    gap: 5, minHeight: 36, paddingHorizontal: 8, borderRadius: 6,
+    flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    gap: 3, minHeight: 36, paddingHorizontal: 3, borderRadius: 6,
   },
+  longConversationTab: { flex: 1.3 },
+  conversationTabText: { fontSize: 11, flexShrink: 1 },
   conversationScroll: { flex: 1 },
   writtenControls: { width: '100%', paddingHorizontal: 22, gap: 10 },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
@@ -1070,6 +1163,7 @@ const styles = StyleSheet.create({
     paddingTop: 12,
   },
   recordingHint: { color: '#587068', fontSize: 12, fontWeight: '700', marginBottom: 10 },
+  writtenKeyboardControls: { paddingBottom: 6 },
   controlRow: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1081,6 +1175,7 @@ const styles = StyleSheet.create({
     width: '100%', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center',
     alignItems: 'center', paddingHorizontal: 20, gap: 12,
   },
+  automaticError: { color: '#9B3024', fontSize: 13, textAlign: 'center', paddingHorizontal: 20, marginBottom: 10 },
   automaticButton: {
     minHeight: 48, paddingHorizontal: 12, borderWidth: 1, borderColor: '#B8C7C1',
     borderRadius: 6, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
@@ -1089,13 +1184,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#C64B38',
     borderRadius: 38,
-    elevation: 5,
     height: 76,
     justifyContent: 'center',
-    shadowColor: '#7D2B20',
-    shadowOffset: { height: 5, width: 0 },
-    shadowOpacity: 0.25,
-    shadowRadius: 9,
     width: 76,
   },
   micButtonRecording: { backgroundColor: '#173E35' },

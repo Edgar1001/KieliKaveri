@@ -1,0 +1,6 @@
+{
+  "problems.decorations.enabled": false,
+  "files.exclude": {
+    "**/node_modules": true
+  }
+}
