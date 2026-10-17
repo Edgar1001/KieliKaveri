@@ -88,6 +88,10 @@ const SPEECH_RECORDING_OPTIONS = {
     audioSource: 'unprocessed' as const,
   },
 };
+const AUTOMATIC_RECORDING_OPTIONS = {
+  ...SPEECH_RECORDING_OPTIONS,
+  android: { ...SPEECH_RECORDING_OPTIONS.android, audioSource: 'voice_recognition' as const },
+};
 
 export default function App() {
   const recorder = useAudioRecorder(SPEECH_RECORDING_OPTIONS);
@@ -310,7 +314,7 @@ export default function App() {
 
       await setAudioModeAsync({ allowsRecording: true });
       if (automatic?.signal.aborted) return;
-      await recorder.prepareToRecordAsync(SPEECH_RECORDING_OPTIONS);
+      await recorder.prepareToRecordAsync(automatic ? AUTOMATIC_RECORDING_OPTIONS : SPEECH_RECORDING_OPTIONS);
       if (automatic?.signal.aborted) {
         await recorder.stop();
         return;
@@ -382,6 +386,7 @@ export default function App() {
       formData.append('level', level);
       formData.append('languageMode', languageMode);
       formData.append('audioDurationMs', `${audioDurationMs}`);
+      if (automatic) formData.append('automatic', 'true');
       formData.append(
         'history',
         JSON.stringify(turns.slice(-4).map(({ transcript, reply }) => ({ transcript, reply }))),

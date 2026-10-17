@@ -142,6 +142,39 @@ class TextConversationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_transcription_omits_previous_question_without_changing_puhe(self) -> None:
+        previous_question = "What did you eat yesterday?"
+        history = json.dumps([{"transcript": "Hello", "reply": previous_question}])
+        expected = TutorResponse(
+            correctedText="Moi!", explanation="A natural greeting.",
+            reply="Mitä kuuluu?", translation="How are you?",
+        )
+        with (
+            patch.object(main, "APP_API_KEY", "test-app-key"),
+            patch.object(main, "transcribe_audio", AsyncMock(return_value="Moi!")) as transcribe,
+            patch.object(main, "generate_tutor_response", AsyncMock(return_value=expected)) as generate,
+            patch.object(main, "add_usage", AsyncMock()),
+            TestClient(main.app) as client,
+        ):
+            for automatic in (False, True):
+                with self.subTest(automatic=automatic):
+                    data = {"history": history, "audioDurationMs": "30000"}
+                    if automatic:
+                        data["automatic"] = "true"
+                    response = client.post(
+                        "/api/conversation", headers={"X-App-Key": "test-app-key"},
+                        data=data, files={"audio": ("speech.m4a", b"test-audio", "audio/mp4")},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    prompt = transcribe.await_args.args[1]
+                    if automatic:
+                        self.assertNotIn(previous_question, prompt)
+                        self.assertIn("Transcribe only words spoken", prompt)
+                    else:
+                        self.assertIn(previous_question, prompt)
+                    self.assertEqual(generate.await_args.args[0], "Moi!")
+                    self.assertEqual(generate.await_args.args[2][-1].reply, previous_question)
+
     async def test_transcribes_with_finnish_context(self) -> None:
         create = AsyncMock(return_value=SimpleNamespace(text="Moi, mitä kuuluu?"))
         client = SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)))

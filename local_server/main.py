@@ -351,6 +351,7 @@ async def conversation(
     languageMode: str = Form("Puhekieli"),
     history: str = Form("[]"),
     audioDurationMs: int = Form(0),
+    automatic: bool = Form(False),
 ) -> dict[str, str]:
     try:
         parsed_topic = TOPIC_ADAPTER.validate_python(topic)
@@ -391,10 +392,12 @@ async def conversation(
 
     try:
         async with INFERENCE_LOCK:
-            transcription_prompt = build_transcription_prompt(
-                parsed_topic,
-                parsed_history,
-                parsed_language_mode,
+            transcription_prompt = (
+                "Finnish speech transcription. Transcribe only words spoken in the recording. "
+                "Preserve colloquial Finnish and incomplete sentences. Do not answer questions, "
+                "complete missing speech, or invent words during silence."
+                if automatic is True
+                else build_transcription_prompt(parsed_topic, parsed_history, parsed_language_mode)
             )
             transcript = await transcribe_audio(temporary_path, transcription_prompt)
             if not transcript:

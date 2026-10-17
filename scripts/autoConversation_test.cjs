@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const vm = require('node:vm');
 const ts = require('typescript');
 
-function harness({ permissionTransition = false, conversationError } = {}) {
+function harness({ permissionTransition = false, conversationError, distinctReplies = false } = {}) {
   const hooks = [];
   let cursor = 0;
   let dirty = true;
@@ -15,6 +15,7 @@ function harness({ permissionTransition = false, conversationError } = {}) {
   let uploads = 0;
   let effects = [];
   const requests = [];
+  const preparations = [];
   const alerts = [];
   const keyboardListeners = {};
   const timers = new Map();
@@ -23,7 +24,7 @@ function harness({ permissionTransition = false, conversationError } = {}) {
   const recorder = {
     uri: 'file:///speech.m4a', isRecording: false,
     getStatus: () => recording,
-    prepareToRecordAsync: async (options) => { assert.equal(options.isMeteringEnabled, true); },
+    prepareToRecordAsync: async (options) => { assert.equal(options.isMeteringEnabled, true); preparations.push(options); },
     record() { recordings += 1; recording.durationMillis = 0; recording.isRecording = true; this.isRecording = true; dirty = true; },
     async stop() { recording.isRecording = false; this.isRecording = false; dirty = true; },
   };
@@ -98,6 +99,10 @@ function harness({ permissionTransition = false, conversationError } = {}) {
         requests.push(request);
         assert.equal(request.body.get('level'), 'B2');
         if (conversationError) return { ok: false, json: async () => ({ error: conversationError }) };
+        if (distinctReplies) {
+          const turn = uploads;
+          return { ok: true, json: async () => ({ transcript: `Learner ${turn}`, reply: `Question ${turn}`, correctedText: `Learner ${turn}`, explanation: 'Correct', translation: `Question ${turn}` }) };
+        }
         return { ok: true, json: async () => ({ transcript: 'Moi', reply: 'Hei', correctedText: 'Moi', explanation: 'Correct', translation: 'Hi' }) };
       } };
       return new Proxy({}, { get: (_object, property) => property });
@@ -150,10 +155,51 @@ function harness({ permissionTransition = false, conversationError } = {}) {
     async keyboardShown() { keyboardListeners.keyboardDidShow(); await settle(); },
     async keyboardHidden() { keyboardListeners.keyboardDidHide(); await settle(); },
     get requests() { return requests; },
+    get preparations() { return preparations; },
     get alerts() { return alerts; },
     get recordings() { return recordings; }, get uploads() { return uploads; }, get recording() { return recorder.isRecording; },
   };
 }
+
+test('speech-recognition capture is restricted to Auto puhe', async () => {
+  const app = harness();
+  await app.settle();
+  await app.press('Start recording');
+  assert.equal(app.preparations[0].android.audioSource, 'unprocessed');
+  await app.press('Stop recording');
+  assert.equal(app.requests[0].body.get('automatic'), null);
+  await app.press('Automatic voice conversation');
+  await app.press('Start automatic conversation');
+  assert.equal(app.preparations[1].android.audioSource, 'voice_recognition');
+  await app.press('Stop automatic conversation');
+  await app.press('Voice conversation');
+  await app.press('Start recording');
+  assert.equal(app.preparations[2].android.audioSource, 'unprocessed');
+  await app.press('Stop recording');
+});
+
+test('automatic timer and polling submissions include the latest history after slider changes', async () => {
+  const app = harness({ distinctReplies: true });
+  await app.settle();
+  await app.press('Automatic voice conversation');
+  await app.setTimeoutSeconds(10);
+  await app.press('Start automatic conversation');
+  const history = [];
+  let recordingSeconds = 10;
+  for (let turn = 1; turn <= 7; turn += 1) {
+    await app.setTimeoutSeconds(turn % 2 === 0 ? 20 : 10);
+    for (const duration of [100, 200, 300, 400]) await app.sample(duration, -20);
+    if (turn % 2 === 0) await app.sample(recordingSeconds * 1000, -60);
+    else await app.expireRecording(recordingSeconds * 1000);
+    assert.equal(app.uploads, turn);
+    assert.deepEqual(JSON.parse(app.requests[turn - 1].body.get('history')), history.slice(-4));
+    history.push({ transcript: `Learner ${turn}`, reply: `Question ${turn}` });
+    await app.finishReply();
+    recordingSeconds = turn % 2 === 0 ? 20 : 10;
+    assert.equal(app.recording, true);
+  }
+  await app.press('Stop automatic conversation');
+});
 
 test('written keyboard reduces footer padding and restores the bottom safe area on dismissal', async () => {
   const app = harness();
@@ -180,6 +226,7 @@ test('automatic voice reuses Puhe API and waits for playback before listening ag
   assert.equal(app.uploads, 0);
   await app.sample(60_000, -60);
   assert.equal(app.uploads, 1);
+  assert.equal(app.requests[0].body.get('automatic'), 'true');
   assert.equal(app.recording, false);
   assert.equal(app.recordings, 1);
   await app.finishReply();
